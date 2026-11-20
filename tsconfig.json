@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "es2023"
+    ],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "types": [
+      "node"
+    ],
+    "paths": {
+      "domeditor/client": [
+        "./src/client/index.tsx"
+      ]
+    }
+  },
+  "include": [
+    "src",
+    "test",
+    "scripts",
+    "tsup.config.ts"
+  ]
+}
