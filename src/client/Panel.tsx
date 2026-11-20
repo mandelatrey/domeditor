@@ -239,7 +239,7 @@ function Inspector({ el }: { el: Element }) {
         {cas.inline.length > 0 && (
           <div className="mt-1 flex gap-2 rounded-md border border-warning/30 bg-warning/10 p-2 text-[11px] text-warning">
             <CircleAlert className="mt-px size-3.5 shrink-0" />
-            <p>Inline style in the component beats the CSS: <code className="font-mono text-foreground">{cas.inline.map((d) => `${d.prop}: ${d.value}`).join("; ")}</code></p>
+            <p>An inline style (from the component, or set by a script such as an animation) beats the CSS: <code className="font-mono text-foreground">{cas.inline.map((d) => `${d.prop}: ${d.value}`).join("; ")}</code></p>
           </div>
         )}
       </section>

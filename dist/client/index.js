@@ -10409,7 +10409,7 @@ function Inspector({ el }) {
       cas.inline.length > 0 && /* @__PURE__ */ jsxs4("div", { className: "mt-1 flex gap-2 rounded-md border border-warning/30 bg-warning/10 p-2 text-[11px] text-warning", children: [
         /* @__PURE__ */ jsx26(CircleExclamationPoint, { className: "mt-px size-3.5 shrink-0" }),
         /* @__PURE__ */ jsxs4("p", { children: [
-          "Inline style in the component beats the CSS: ",
+          "An inline style (from the component, or set by a script such as an animation) beats the CSS: ",
           /* @__PURE__ */ jsx26("code", { className: "font-mono text-foreground", children: cas.inline.map((d) => `${d.prop}: ${d.value}`).join("; ") })
         ] })
       ] })
