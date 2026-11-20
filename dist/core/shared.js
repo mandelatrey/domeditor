@@ -1,13 +1,18 @@
 import {
+  WEIGHT_NAMES,
   alignRules,
   compareSpec,
   composeBox,
+  composeClamp,
+  describeCondition,
+  describeState,
   expandBox,
   formatNumber,
   normCondition,
   normSelector,
   nudge,
   numberAt,
+  parseClamp,
   readProp,
   ruleKey,
   sameDecls,
@@ -15,20 +20,26 @@ import {
   specificity,
   splitTop,
   stepFor,
+  weightName,
   writeProp,
   writeSides
-} from "../chunk-LBGJCDWO.js";
+} from "../chunk-5L7PTTPN.js";
 import "../chunk-MLKGABMK.js";
 export {
+  WEIGHT_NAMES,
   alignRules,
   compareSpec,
   composeBox,
+  composeClamp,
+  describeCondition,
+  describeState,
   expandBox,
   formatNumber,
   normCondition,
   normSelector,
   nudge,
   numberAt,
+  parseClamp,
   readProp,
   ruleKey,
   sameDecls,
@@ -36,6 +47,7 @@ export {
   specificity,
   splitTop,
   stepFor,
+  weightName,
   writeProp,
   writeSides
 };

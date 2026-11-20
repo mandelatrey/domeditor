@@ -337,3 +337,76 @@ export function alignRules<T extends { selector: string; context: string[] }>(it
   }
   return out;
 }
+
+// ---------- plain words for designers
+
+/** A media/supports condition in plain words: "(max-width: 640px)" -> "Screens up to 640px wide". */
+export function describeCondition(text: string): string {
+  const t = text.replace(/^@(media|supports|container)\s*/i, "").trim();
+  const words: string[] = [];
+  let rest = t;
+  const take = (re: RegExp, fn: (m: RegExpExecArray) => string) => {
+    const m = re.exec(rest);
+    if (!m) return;
+    words.push(fn(m));
+    rest = rest.replace(m[0], "");
+  };
+  const num = (s: string) => s.replace(/\.0+(?=\D)/, "");
+  const min = /\(\s*min-width\s*:\s*([\d.]+[a-z]*)\s*\)|\(\s*width\s*>=?\s*([\d.]+[a-z]*)\s*\)/i.exec(t);
+  const max = /\(\s*max-width\s*:\s*([\d.]+[a-z]*)\s*\)|\(\s*width\s*<=?\s*([\d.]+[a-z]*)\s*\)/i.exec(t);
+  if (min && max) {
+    words.push(`Screens ${num(min[1] ?? min[2]!)}–${num(max[1] ?? max[2]!)} wide`);
+    rest = rest.replace(min[0], "").replace(max[0], "");
+  } else {
+    take(/\(\s*min-width\s*:\s*([\d.]+[a-z]*)\s*\)|\(\s*width\s*>=?\s*([\d.]+[a-z]*)\s*\)/i, (m) => `Screens ${num(m[1] ?? m[2]!)} and wider`);
+    take(/\(\s*max-width\s*:\s*([\d.]+[a-z]*)\s*\)|\(\s*width\s*<=?\s*([\d.]+[a-z]*)\s*\)/i, (m) => `Screens up to ${num(m[1] ?? m[2]!)} wide`);
+  }
+  take(/\(\s*prefers-color-scheme\s*:\s*(dark|light)\s*\)/i, (m) => (m[1]!.toLowerCase() === "dark" ? "Dark mode" : "Light mode"));
+  take(/\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)/i, () => "Reduced motion");
+  take(/\(\s*prefers-reduced-motion\s*:\s*no-preference\s*\)/i, () => "Animations allowed");
+  take(/\(\s*hover\s*:\s*hover\s*\)/i, () => "Mouse or trackpad");
+  take(/\(\s*hover\s*:\s*none\s*\)/i, () => "Touch screens");
+  take(/\(\s*orientation\s*:\s*(portrait|landscape)\s*\)/i, (m) => `${m[1]![0]!.toUpperCase()}${m[1]!.slice(1).toLowerCase()} screens`);
+  take(/^\s*print\s*/i, () => "When printed");
+  const leftover = rest.replace(/\b(and|only|screen|all)\b|,/gi, "").trim();
+  if (!words.length || leftover) return t; // something we cannot put in words: show it as written
+  return words.join(", ");
+}
+
+const STATE_WORDS: Record<string, string> = {
+  hover: "On hover", "focus-visible": "Keyboard focus", "focus-within": "When something inside has focus", focus: "When focused",
+  active: "While pressed", visited: "Visited links", before: "Added before the content", after: "Added after the content",
+  placeholder: "Placeholder text", marker: "List markers", selection: "Selected text", "first-line": "First line", "first-letter": "First letter",
+};
+
+/** ":hover::before" -> "On hover · Added before the content" */
+export function describeState(state: string): string {
+  return (state.match(/::?[\w-]+/g) ?? []).map((s) => STATE_WORDS[s.replace(/^::?/, "")] ?? s).join(" · ");
+}
+
+// ---------- responsive font sizes
+
+/** "clamp(32px, 5vw, 56px)" -> ["32px", "5vw", "56px"], or null if the value is not a clamp(). */
+export function parseClamp(v: string): [string, string, string] | null {
+  const m = /^\s*clamp\((.*)\)\s*$/i.exec(v);
+  if (!m) return null;
+  const parts = splitTop(m[1]!);
+  return parts.length === 3 ? (parts as [string, string, string]) : null;
+}
+export const composeClamp = ([a, b, c]: readonly string[]) => `clamp(${a}, ${b}, ${c})`;
+
+// ---------- font weights
+
+export const WEIGHT_NAMES: [number, string][] = [
+  [100, "Thin"], [200, "Extra light"], [300, "Light"], [400, "Regular"], [500, "Medium"],
+  [600, "Semibold"], [700, "Bold"], [800, "Extra bold"], [900, "Black"],
+];
+/** 650 -> "Semibold+"; "bold" -> "Bold" */
+export function weightName(w: string): string {
+  const n = w === "normal" ? 400 : w === "bold" ? 700 : Number(w);
+  if (!Number.isFinite(n)) return w;
+  const exact = WEIGHT_NAMES.find(([v]) => v === n);
+  if (exact) return exact[1];
+  const below = [...WEIGHT_NAMES].reverse().find(([v]) => v < n);
+  return below ? `${below[1]}+` : WEIGHT_NAMES[0]![1];
+}

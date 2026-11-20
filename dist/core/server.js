@@ -1,18 +1,28 @@
 import {
   EditError,
+  TextError,
   appendRule,
   applyRuleEdit,
   createHandler,
   cssFiles,
-  sourceRules
-} from "../chunk-IGW4QBXY.js";
-import "../chunk-LBGJCDWO.js";
+  findTextIn,
+  projectFiles,
+  replaceText,
+  sourceRules,
+  textPattern
+} from "../chunk-7U5S2TYZ.js";
+import "../chunk-5L7PTTPN.js";
 import "../chunk-MLKGABMK.js";
 export {
   EditError,
+  TextError,
   appendRule,
   applyRuleEdit,
   createHandler,
   cssFiles,
-  sourceRules
+  findTextIn,
+  projectFiles,
+  replaceText,
+  sourceRules,
+  textPattern
 };

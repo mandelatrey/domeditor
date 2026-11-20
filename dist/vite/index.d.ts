@@ -6,8 +6,8 @@ import '../core/shared.js';
 type DomEditorViteOptions = Omit<HandlerOptions, "root"> & {
     /** Where the endpoint is served. Default: /__domeditor */
     endpoint?: string;
-    /** Panel colours. Default: "dark". */
-    theme?: "dark" | "light" | "system";
+    /** Panel colours. "auto" (the default) follows the page's light/dark setting. */
+    theme?: "auto" | "dark" | "light" | "system";
 };
 declare module "node:http" {
     interface IncomingMessage {

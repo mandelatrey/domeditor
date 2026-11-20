@@ -5,8 +5,8 @@ import { useEffect } from "react";
 export type DomEditorProps = {
   /** Where the route is served. Default: /api/dev/domeditor (app/api/dev/domeditor/route.dev.ts) */
   endpoint?: string;
-  /** Panel colours. Default: "dark". */
-  theme?: "dark" | "light" | "system";
+  /** Panel colours. "auto" (the default) follows the page's light/dark setting. */
+  theme?: "auto" | "dark" | "light" | "system";
 };
 
 export function DomEditor({ endpoint = "/api/dev/domeditor", theme }: DomEditorProps) {

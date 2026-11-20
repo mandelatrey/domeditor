@@ -90,6 +90,16 @@ declare function alignRules<T extends {
     selector: string;
     context: string[];
 }>(items: readonly T[], sources: readonly SourceRule[]): Alignment<T>[];
+/** A media/supports condition in plain words: "(max-width: 640px)" -> "Screens up to 640px wide". */
+declare function describeCondition(text: string): string;
+/** ":hover::before" -> "On hover · Added before the content" */
+declare function describeState(state: string): string;
+/** "clamp(32px, 5vw, 56px)" -> ["32px", "5vw", "56px"], or null if the value is not a clamp(). */
+declare function parseClamp(v: string): [string, string, string] | null;
+declare const composeClamp: ([a, b, c]: readonly string[]) => string;
+declare const WEIGHT_NAMES: [number, string][];
+/** 650 -> "Semibold+"; "bold" -> "Bold" */
+declare function weightName(w: string): string;
 
-export { alignRules, compareSpec, composeBox, expandBox, formatNumber, normCondition, normSelector, nudge, numberAt, readProp, ruleKey, sameDecls, serializeDecls, specificity, splitTop, stepFor, writeProp, writeSides };
+export { WEIGHT_NAMES, alignRules, compareSpec, composeBox, composeClamp, describeCondition, describeState, expandBox, formatNumber, normCondition, normSelector, nudge, numberAt, parseClamp, readProp, ruleKey, sameDecls, serializeDecls, specificity, splitTop, stepFor, weightName, writeProp, writeSides };
 export type { Alignment, Decl, NumberToken, RuleRef, Side, SourceRule, Spec };

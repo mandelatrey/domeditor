@@ -7,8 +7,8 @@ import { createHandler, type HandlerOptions } from "../core/server";
 export type DomEditorViteOptions = Omit<HandlerOptions, "root"> & {
   /** Where the endpoint is served. Default: /__domeditor */
   endpoint?: string;
-  /** Panel colours. Default: "dark". */
-  theme?: "dark" | "light" | "system";
+  /** Panel colours. "auto" (the default) follows the page's light/dark setting. */
+  theme?: "auto" | "dark" | "light" | "system";
 };
 
 const DEFAULT_ENDPOINT = "/__domeditor";

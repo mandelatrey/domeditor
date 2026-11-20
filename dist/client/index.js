@@ -1,18 +1,24 @@
 import {
+  WEIGHT_NAMES,
   alignRules,
   compareSpec,
+  composeClamp,
+  describeCondition,
+  describeState,
   normCondition,
   normSelector,
   nudge,
+  parseClamp,
   readProp,
   ruleKey,
   sameDecls,
   serializeDecls,
   specificity,
   splitTop,
+  weightName,
   writeProp,
   writeSides
-} from "../chunk-LBGJCDWO.js";
+} from "../chunk-5L7PTTPN.js";
 import {
   __export
 } from "../chunk-MLKGABMK.js";
@@ -21,8 +27,26 @@ import {
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
+// src/client/color.ts
+var ctx = null;
+function toRgba(color) {
+  ctx ??= document.createElement("canvas").getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.clearRect(0, 0, 1, 1);
+  ctx.fillStyle = "#000";
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, 1, 1);
+  const [r2, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+  return [r2, g, b, a / 255];
+}
+function toHex(color) {
+  const c = toRgba(color);
+  return c ? `#${c.slice(0, 3).map((n) => n.toString(16).padStart(2, "0")).join("")}` : "#000000";
+}
+
 // src/client/model.ts
 var HEADERS = { "x-domeditor": "1", "Content-Type": "application/json" };
+var squash = (s) => s.replace(/\s+/g, " ").trim();
 var STATES = /::?(hover|focus-visible|focus-within|focus|active|visited|before|after|placeholder|marker|selection|first-line|first-letter)\b/gi;
 var probe = typeof document !== "undefined" ? document.createElement("div").style : null;
 var SHORT = {
@@ -54,6 +78,10 @@ var Store = class {
   sources = /* @__PURE__ */ new Map();
   edits = /* @__PURE__ */ new Map();
   // rule key -> its declarations as edited (unsaved)
+  texts = /* @__PURE__ */ new Map();
+  // text changes (unsaved)
+  places = /* @__PURE__ */ new Map();
+  // where each text is written, as far as looked up
   live = [];
   selected = null;
   hovered = null;
@@ -146,21 +174,76 @@ var Store = class {
     this.message = null;
     this.emit();
   }
+  /** How many changes are waiting to be saved. */
+  get pending() {
+    return this.edits.size + this.texts.size;
+  }
+  /** Change a text on the page: shown at once, written into the source on save. */
+  setText(node, after) {
+    const c = this.texts.get(node);
+    const original = c?.original ?? node.data;
+    const before = squash(original);
+    if (squash(after) === before) {
+      node.data = original;
+      this.texts.delete(node);
+    } else {
+      const lead = /^\s*/.exec(original)[0], trail = /\s*$/.exec(original)[0];
+      node.data = lead + after + trail;
+      this.texts.set(node, { ...c, node, original, before, after });
+    }
+    this.message = null;
+    this.emit();
+  }
+  revertText(node) {
+    const c = this.texts.get(node);
+    if (c) node.data = c.original;
+    this.texts.delete(node);
+    this.emit();
+  }
+  chooseTextPlace(node, at2) {
+    const c = this.texts.get(node);
+    if (c) this.texts.set(node, { ...c, at: at2, choices: void 0 });
+    this.message = null;
+    this.emit();
+  }
+  /** Look up where texts are written (once each). */
+  async findPlaces(texts) {
+    const todo = [...new Set(texts.map(squash))].filter((t) => t && !this.places.has(t));
+    if (!todo.length) return;
+    for (const t of todo) this.places.set(t, "looking");
+    try {
+      const r2 = await fetch(this.endpoint, { method: "POST", headers: HEADERS, body: JSON.stringify({ find: todo }) });
+      const data = await r2.json();
+      todo.forEach((t, i) => this.places.set(t, data.found?.[i] ?? []));
+    } catch {
+      for (const t of todo) this.places.delete(t);
+    }
+    this.emit();
+  }
   revert(key) {
     const src = this.sources.get(key);
     if (src) this.setDecls(key, src.decls);
   }
   discardAll() {
     for (const key of [...this.edits.keys()]) this.revert(key);
+    for (const node of [...this.texts.keys()]) this.revertText(node);
   }
   async save() {
-    if (this.edits.size === 0) return;
+    if (this.pending === 0) return;
     const edits = [...this.edits].map(([key, after]) => {
       const s = this.sources.get(key);
       return { ref: { file: s.file, context: s.context, selector: s.selector, occurrence: s.occurrence }, before: s.decls, after };
     });
-    const r2 = await this.post({ edits });
-    if (!r2.ok) return this.fail(r2.error);
+    const changes = [...this.texts.values()];
+    const texts = changes.map((c) => ({ before: c.before, after: squash(c.after), at: c.at }));
+    const r2 = await this.post({ edits, texts });
+    if (!r2.ok) {
+      const c = r2.text !== void 0 ? changes.find((x) => x.before === r2.text) : void 0;
+      if (c && r2.hits?.length) this.texts.set(c.node, { ...c, choices: r2.hits });
+      return this.fail(r2.error);
+    }
+    this.texts.clear();
+    this.places.clear();
     for (const [key, after] of this.edits) {
       const s = this.sources.get(key);
       if (s) this.sources.set(key, { ...s, decls: after });
@@ -168,7 +251,8 @@ var Store = class {
     this.edits.clear();
     this.message = { kind: "ok", text: `Saved to ${r2.files.map(shortFile).join(", ")}` };
     this.emit();
-    for (const ms of [1500, 4e3]) setTimeout(() => void refreshSavedSheets(r2.files), ms);
+    const css = r2.files.filter((f) => f.endsWith(".css"));
+    if (css.length) for (const ms of [1500, 4e3]) setTimeout(() => void refreshSavedSheets(css), ms);
   }
   async createRule(file, selector) {
     const r2 = await this.post({ create: { file, selector, decls: [] } });
@@ -180,7 +264,7 @@ var Store = class {
     try {
       const r2 = await fetch(this.endpoint, { method: "POST", headers: HEADERS, body: JSON.stringify(payload) });
       const data = await r2.json();
-      return r2.ok ? { ok: true, files: data.files ?? [] } : { ok: false, error: data.error ?? `error ${r2.status}` };
+      return r2.ok ? { ok: true, files: data.files ?? [] } : { ok: false, error: data.error ?? `error ${r2.status}`, text: data.text, hits: data.hits };
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -729,8 +813,21 @@ var __iconData7 = {
 __iconData7.node;
 var CornerDownLeft = createLucideIcon(__iconData7);
 
-// node_modules/lucide-react/dist/esm/icons/file-code.mjs
+// node_modules/lucide-react/dist/esm/icons/database.mjs
 var __iconData8 = {
+  name: "database",
+  size: 24,
+  node: [
+    ["ellipse", { cx: "12", cy: "5", rx: "9", ry: "3", key: "msslwz" }],
+    ["path", { d: "M3 5V19A9 3 0 0 0 21 19V5", key: "1wlel7" }],
+    ["path", { d: "M3 12A9 3 0 0 0 21 12", key: "mv7ke4" }]
+  ]
+};
+__iconData8.node;
+var Database = createLucideIcon(__iconData8);
+
+// node_modules/lucide-react/dist/esm/icons/file-code.mjs
+var __iconData9 = {
   name: "file-code",
   size: 24,
   node: [
@@ -746,11 +843,11 @@ var __iconData8 = {
     ["path", { d: "m14 12.5 2 2.5-2 2.5", key: "yinavb" }]
   ]
 };
-__iconData8.node;
-var FileCode = createLucideIcon(__iconData8);
+__iconData9.node;
+var FileCode = createLucideIcon(__iconData9);
 
 // node_modules/lucide-react/dist/esm/icons/link-2.mjs
-var __iconData9 = {
+var __iconData10 = {
   name: "link-2",
   size: 24,
   node: [
@@ -759,11 +856,20 @@ var __iconData9 = {
     ["line", { x1: "8", x2: "16", y1: "12", y2: "12", key: "1jonct" }]
   ]
 };
-__iconData9.node;
-var Link2 = createLucideIcon(__iconData9);
+__iconData10.node;
+var Link2 = createLucideIcon(__iconData10);
+
+// node_modules/lucide-react/dist/esm/icons/minus.mjs
+var __iconData11 = {
+  name: "minus",
+  size: 24,
+  node: [["path", { d: "M5 12h14", key: "1ays0h" }]]
+};
+__iconData11.node;
+var Minus = createLucideIcon(__iconData11);
 
 // node_modules/lucide-react/dist/esm/icons/mouse-pointer-2.mjs
-var __iconData10 = {
+var __iconData12 = {
   name: "mouse-pointer-2",
   size: 24,
   node: [
@@ -776,11 +882,11 @@ var __iconData10 = {
     ]
   ]
 };
-__iconData10.node;
-var MousePointer2 = createLucideIcon(__iconData10);
+__iconData12.node;
+var MousePointer2 = createLucideIcon(__iconData12);
 
 // node_modules/lucide-react/dist/esm/icons/panel-left.mjs
-var __iconData11 = {
+var __iconData13 = {
   name: "panel-left",
   size: 24,
   node: [
@@ -789,11 +895,11 @@ var __iconData11 = {
   ],
   aliases: ["sidebar"]
 };
-__iconData11.node;
-var PanelLeft = createLucideIcon(__iconData11);
+__iconData13.node;
+var PanelLeft = createLucideIcon(__iconData13);
 
 // node_modules/lucide-react/dist/esm/icons/panel-right.mjs
-var __iconData12 = {
+var __iconData14 = {
   name: "panel-right",
   size: 24,
   node: [
@@ -801,11 +907,11 @@ var __iconData12 = {
     ["path", { d: "M15 3v18", key: "14nvp0" }]
   ]
 };
-__iconData12.node;
-var PanelRight = createLucideIcon(__iconData12);
+__iconData14.node;
+var PanelRight = createLucideIcon(__iconData14);
 
 // node_modules/lucide-react/dist/esm/icons/plus.mjs
-var __iconData13 = {
+var __iconData15 = {
   name: "plus",
   size: 24,
   node: [
@@ -813,11 +919,11 @@ var __iconData13 = {
     ["path", { d: "M12 5v14", key: "s699le" }]
   ]
 };
-__iconData13.node;
-var Plus = createLucideIcon(__iconData13);
+__iconData15.node;
+var Plus = createLucideIcon(__iconData15);
 
 // node_modules/lucide-react/dist/esm/icons/square-dashed-mouse-pointer.mjs
-var __iconData14 = {
+var __iconData16 = {
   name: "square-dashed-mouse-pointer",
   size: 24,
   node: [
@@ -840,11 +946,11 @@ var __iconData14 = {
   ],
   aliases: ["mouse-pointer-square-dashed"]
 };
-__iconData14.node;
-var SquareDashedMousePointer = createLucideIcon(__iconData14);
+__iconData16.node;
+var SquareDashedMousePointer = createLucideIcon(__iconData16);
 
 // node_modules/lucide-react/dist/esm/icons/text-align-center.mjs
-var __iconData15 = {
+var __iconData17 = {
   name: "text-align-center",
   size: 24,
   node: [
@@ -854,11 +960,11 @@ var __iconData15 = {
   ],
   aliases: ["align-center"]
 };
-__iconData15.node;
-var TextAlignCenter = createLucideIcon(__iconData15);
+__iconData17.node;
+var TextAlignCenter = createLucideIcon(__iconData17);
 
 // node_modules/lucide-react/dist/esm/icons/text-align-end.mjs
-var __iconData16 = {
+var __iconData18 = {
   name: "text-align-end",
   size: 24,
   node: [
@@ -868,11 +974,11 @@ var __iconData16 = {
   ],
   aliases: ["align-right"]
 };
-__iconData16.node;
-var TextAlignEnd = createLucideIcon(__iconData16);
+__iconData18.node;
+var TextAlignEnd = createLucideIcon(__iconData18);
 
 // node_modules/lucide-react/dist/esm/icons/text-align-justify.mjs
-var __iconData17 = {
+var __iconData19 = {
   name: "text-align-justify",
   size: 24,
   node: [
@@ -882,11 +988,11 @@ var __iconData17 = {
   ],
   aliases: ["align-justify"]
 };
-__iconData17.node;
-var TextAlignJustify = createLucideIcon(__iconData17);
+__iconData19.node;
+var TextAlignJustify = createLucideIcon(__iconData19);
 
 // node_modules/lucide-react/dist/esm/icons/text-align-start.mjs
-var __iconData18 = {
+var __iconData20 = {
   name: "text-align-start",
   size: 24,
   node: [
@@ -896,11 +1002,11 @@ var __iconData18 = {
   ],
   aliases: ["text", "align-left"]
 };
-__iconData18.node;
-var TextAlignStart = createLucideIcon(__iconData18);
+__iconData20.node;
+var TextAlignStart = createLucideIcon(__iconData20);
 
 // node_modules/lucide-react/dist/esm/icons/undo-2.mjs
-var __iconData19 = {
+var __iconData21 = {
   name: "undo-2",
   size: 24,
   node: [
@@ -908,11 +1014,11 @@ var __iconData19 = {
     ["path", { d: "M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11", key: "f3b9sd" }]
   ]
 };
-__iconData19.node;
-var Undo2 = createLucideIcon(__iconData19);
+__iconData21.node;
+var Undo2 = createLucideIcon(__iconData21);
 
 // node_modules/lucide-react/dist/esm/icons/x.mjs
-var __iconData20 = {
+var __iconData22 = {
   name: "x",
   size: 24,
   node: [
@@ -920,8 +1026,8 @@ var __iconData20 = {
     ["path", { d: "m6 6 12 12", key: "d8bk6v" }]
   ]
 };
-__iconData20.node;
-var X = createLucideIcon(__iconData20);
+__iconData22.node;
+var X = createLucideIcon(__iconData22);
 
 // src/client/Panel.tsx
 import { useEffect as useEffect14, useMemo as useMemo10, useRef as useRef17, useState as useState15, useSyncExternalStore } from "react";
@@ -4501,14 +4607,14 @@ function useUnwrappedLazy(value) {
 }
 __name2(useUnwrappedLazy, "useUnwrappedLazy");
 function concatAriaDescribedby(...values) {
-  const ids = /* @__PURE__ */ new Set();
+  const ids2 = /* @__PURE__ */ new Set();
   for (const value of values) {
     if (typeof value !== "string") continue;
     for (const id of String(value).trim().split(/\s+/)) {
-      if (id) ids.add(id);
+      if (id) ids2.add(id);
     }
   }
-  return ids.size > 0 ? Array.from(ids).join(" ") : void 0;
+  return ids2.size > 0 ? Array.from(ids2).join(" ") : void 0;
 }
 __name2(concatAriaDescribedby, "concatAriaDescribedby");
 var createSlotError = /* @__PURE__ */ __name2((ownerName) => {
@@ -9900,14 +10006,14 @@ function getHullPresorted(points) {
 }
 __name26(getHullPresorted, "getHullPresorted");
 function concatAriaDescribedby2(...values) {
-  const ids = /* @__PURE__ */ new Set();
+  const ids2 = /* @__PURE__ */ new Set();
   for (const value of values) {
     if (typeof value !== "string") continue;
     for (const id of String(value).trim().split(/\s+/)) {
-      if (id) ids.add(id);
+      if (id) ids2.add(id);
     }
   }
-  return ids.size > 0 ? Array.from(ids).join(" ") : void 0;
+  return ids2.size > 0 ? Array.from(ids2).join(" ") : void 0;
 }
 __name26(concatAriaDescribedby2, "concatAriaDescribedby");
 
@@ -10072,17 +10178,35 @@ function ToggleGroupItem3({ className, ...props }) {
   );
 }
 
+// src/client/ui/textarea.tsx
+import { jsx as jsx25 } from "react/jsx-runtime";
+function Textarea({ className, ...props }) {
+  return /* @__PURE__ */ jsx25(
+    "textarea",
+    {
+      "data-slot": "textarea",
+      spellCheck: true,
+      className: cn(
+        "field-sizing-content min-h-8 w-full resize-none rounded-md border border-input bg-input/30 px-2 py-1.5 text-[12.5px] leading-snug text-foreground shadow-xs outline-none",
+        "placeholder:text-muted-foreground/70 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:opacity-50",
+        className
+      ),
+      ...props
+    }
+  );
+}
+
 // src/client/ui/portal.tsx
 import { createContext as createContext6, useContext as useContext6 } from "react";
 var PortalContainer = createContext6(null);
 var usePortalContainer = () => useContext6(PortalContainer) ?? void 0;
 
 // src/client/ui/tooltip.tsx
-import { Fragment as Fragment2, jsx as jsx25, jsxs as jsxs3 } from "react/jsx-runtime";
-var TooltipProvider2 = ({ delayDuration = 300, ...props }) => /* @__PURE__ */ jsx25(dist_exports7.Provider, { "data-slot": "tooltip-provider", delayDuration, ...props });
+import { Fragment as Fragment2, jsx as jsx26, jsxs as jsxs3 } from "react/jsx-runtime";
+var TooltipProvider2 = ({ delayDuration = 300, ...props }) => /* @__PURE__ */ jsx26(dist_exports7.Provider, { "data-slot": "tooltip-provider", delayDuration, ...props });
 function TooltipContent3({ className, sideOffset = 6, children, ...props }) {
   const container = usePortalContainer();
-  return /* @__PURE__ */ jsx25(dist_exports7.Portal, { container, children: /* @__PURE__ */ jsx25(
+  return /* @__PURE__ */ jsx26(dist_exports7.Portal, { container, children: /* @__PURE__ */ jsx26(
     dist_exports7.Content,
     {
       "data-slot": "tooltip-content",
@@ -10100,15 +10224,15 @@ function TooltipContent3({ className, sideOffset = 6, children, ...props }) {
   ) });
 }
 function Tip({ label: label2, side, children }) {
-  if (!label2) return /* @__PURE__ */ jsx25(Fragment2, { children });
+  if (!label2) return /* @__PURE__ */ jsx26(Fragment2, { children });
   return /* @__PURE__ */ jsxs3(dist_exports7.Root, { children: [
-    /* @__PURE__ */ jsx25(dist_exports7.Trigger, { asChild: true, children }),
-    /* @__PURE__ */ jsx25(TooltipContent3, { side, children: label2 })
+    /* @__PURE__ */ jsx26(dist_exports7.Trigger, { asChild: true, children }),
+    /* @__PURE__ */ jsx26(TooltipContent3, { side, children: label2 })
   ] });
 }
 
 // src/client/Panel.tsx
-import { Fragment as Fragment3, jsx as jsx26, jsxs as jsxs4 } from "react/jsx-runtime";
+import { Fragment as Fragment3, jsx as jsx27, jsxs as jsxs4 } from "react/jsx-runtime";
 var OPEN_KEY = "domeditor:open";
 var DOCK_KEY = "domeditor:dock";
 var TAB_KEY = "domeditor:tab";
@@ -10210,7 +10334,7 @@ function Panel() {
         store.hovered = null;
         store.emit();
       }
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && store.edits.size) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && store.pending) {
         e.preventDefault();
         void store.save();
       }
@@ -10239,9 +10363,9 @@ function Panel() {
         onClick: () => setOpen(true),
         className: "fixed right-4 bottom-4 z-[2147483000] h-8 rounded-full border px-3 shadow-lg opacity-85 hover:opacity-100",
         children: [
-          /* @__PURE__ */ jsx26(SquareDashedMousePointer, {}),
+          /* @__PURE__ */ jsx27(SquareDashedMousePointer, {}),
           " Styles",
-          store.edits.size > 0 && /* @__PURE__ */ jsx26("span", { className: "size-1.5 rounded-full bg-warning" }),
+          store.pending > 0 && /* @__PURE__ */ jsx27("span", { className: "size-1.5 rounded-full bg-warning" }),
           /* @__PURE__ */ jsxs4(Kbd, { className: "ml-0.5", children: [
             "\u21E7",
             ALT,
@@ -10253,7 +10377,7 @@ function Panel() {
   }
   const DockIcon = dock === "right" ? PanelLeft : PanelRight;
   return /* @__PURE__ */ jsxs4(Fragment3, { children: [
-    /* @__PURE__ */ jsx26(Overlay, {}),
+    /* @__PURE__ */ jsx27(Overlay, {}),
     /* @__PURE__ */ jsxs4(
       "aside",
       {
@@ -10265,18 +10389,18 @@ function Panel() {
         ),
         children: [
           /* @__PURE__ */ jsxs4("header", { className: "flex h-11 shrink-0 items-center gap-2 border-b px-3", children: [
-            /* @__PURE__ */ jsx26(SquareDashedMousePointer, { className: "size-4 text-primary" }),
-            /* @__PURE__ */ jsx26("span", { className: "text-[13px] font-semibold", children: "Styles" }),
-            /* @__PURE__ */ jsx26(Tip, { label: "Viewport width: @media rules depend on it", children: /* @__PURE__ */ jsxs4(Badge, { variant: "outline", className: "font-mono", children: [
+            /* @__PURE__ */ jsx27(SquareDashedMousePointer, { className: "size-4 text-primary" }),
+            /* @__PURE__ */ jsx27("span", { className: "text-[13px] font-semibold", children: "Styles" }),
+            /* @__PURE__ */ jsx27(Tip, { label: "Viewport width: @media rules depend on it", children: /* @__PURE__ */ jsxs4(Badge, { variant: "outline", className: "font-mono", children: [
               window.innerWidth,
               "px"
             ] }) }),
-            /* @__PURE__ */ jsx26("span", { className: "flex-1" }),
-            /* @__PURE__ */ jsx26(Tip, { label: /* @__PURE__ */ jsxs4(Fragment3, { children: [
+            /* @__PURE__ */ jsx27("span", { className: "flex-1" }),
+            /* @__PURE__ */ jsx27(Tip, { label: /* @__PURE__ */ jsxs4(Fragment3, { children: [
               "Pick an element. Or ",
               ALT,
               "+click anything, any time. ",
-              /* @__PURE__ */ jsx26(Kbd, { children: "Esc" }),
+              /* @__PURE__ */ jsx27(Kbd, { children: "Esc" }),
               " stops."
             ] }), children: /* @__PURE__ */ jsxs4(
               Button,
@@ -10289,23 +10413,23 @@ function Panel() {
                   store.emit();
                 },
                 children: [
-                  /* @__PURE__ */ jsx26(MousePointer2, {}),
+                  /* @__PURE__ */ jsx27(MousePointer2, {}),
                   " Pick"
                 ]
               }
             ) }),
-            /* @__PURE__ */ jsx26(Tip, { label: "Move to the other side", children: /* @__PURE__ */ jsx26(Button, { size: "icon-sm", variant: "ghost", "aria-label": "Move to the other side", onClick: () => setDock(dock === "right" ? "left" : "right"), children: /* @__PURE__ */ jsx26(DockIcon, {}) }) }),
-            /* @__PURE__ */ jsx26(Tip, { label: /* @__PURE__ */ jsxs4(Fragment3, { children: [
+            /* @__PURE__ */ jsx27(Tip, { label: "Move to the other side", children: /* @__PURE__ */ jsx27(Button, { size: "icon-sm", variant: "ghost", "aria-label": "Move to the other side", onClick: () => setDock(dock === "right" ? "left" : "right"), children: /* @__PURE__ */ jsx27(DockIcon, {}) }) }),
+            /* @__PURE__ */ jsx27(Tip, { label: /* @__PURE__ */ jsxs4(Fragment3, { children: [
               "Close ",
               /* @__PURE__ */ jsxs4(Kbd, { children: [
                 "\u21E7",
                 ALT,
                 "E"
               ] })
-            ] }), children: /* @__PURE__ */ jsx26(Button, { size: "icon-sm", variant: "ghost", "aria-label": "Close", onClick: () => setOpen(false), children: /* @__PURE__ */ jsx26(X, {}) }) })
+            ] }), children: /* @__PURE__ */ jsx27(Button, { size: "icon-sm", variant: "ghost", "aria-label": "Close", onClick: () => setOpen(false), children: /* @__PURE__ */ jsx27(X, {}) }) })
           ] }),
-          /* @__PURE__ */ jsx26("div", { className: "min-h-0 flex-1 overflow-y-auto overscroll-contain", children: store.selected?.isConnected ? /* @__PURE__ */ jsx26(Inspector, { el: store.selected }) : /* @__PURE__ */ jsx26(Empty, { gone: !!store.selected }) }),
-          /* @__PURE__ */ jsx26(Footer, {})
+          /* @__PURE__ */ jsx27("div", { className: "min-h-0 flex-1 overflow-y-auto overscroll-contain", children: store.selected?.isConnected ? /* @__PURE__ */ jsx27(Inspector, { el: store.selected }) : /* @__PURE__ */ jsx27(Empty, { gone: !!store.selected }) }),
+          /* @__PURE__ */ jsx27(Footer, {})
         ]
       }
     )
@@ -10313,31 +10437,35 @@ function Panel() {
 }
 function Empty({ gone }) {
   return /* @__PURE__ */ jsxs4("div", { className: "grid gap-4 p-4 text-muted-foreground", children: [
-    gone && /* @__PURE__ */ jsx26("p", { className: "text-warning", children: "The selected element left the page." }),
+    gone && /* @__PURE__ */ jsx27("p", { className: "text-warning", children: "The selected element left the page." }),
     /* @__PURE__ */ jsxs4("div", { className: "grid justify-items-center gap-2 rounded-lg border border-dashed px-4 py-6 text-center", children: [
-      /* @__PURE__ */ jsx26(MousePointer2, { className: "size-5 text-foreground" }),
+      /* @__PURE__ */ jsx27(MousePointer2, { className: "size-5 text-foreground" }),
       /* @__PURE__ */ jsxs4("p", { className: "text-foreground", children: [
-        /* @__PURE__ */ jsx26("b", { children: "Pick" }),
+        /* @__PURE__ */ jsx27("b", { children: "Pick" }),
         " an element, or ",
-        /* @__PURE__ */ jsx26(Kbd, { children: ALT }),
+        /* @__PURE__ */ jsx27(Kbd, { children: ALT }),
         " + click anything on the page."
       ] })
     ] }),
     /* @__PURE__ */ jsxs4("ul", { className: "grid list-disc gap-2 pl-4 leading-relaxed", children: [
       /* @__PURE__ */ jsxs4("li", { children: [
-        "Type a value, press ",
-        /* @__PURE__ */ jsx26(Kbd, { children: "\u2191" }),
+        "Use ",
+        /* @__PURE__ */ jsx27("b", { className: "text-foreground", children: "\u2212" }),
+        " and ",
+        /* @__PURE__ */ jsx27("b", { className: "text-foreground", children: "+" }),
+        ", type a value, or press ",
+        /* @__PURE__ */ jsx27(Kbd, { children: "\u2191" }),
         " ",
-        /* @__PURE__ */ jsx26(Kbd, { children: "\u2193" }),
+        /* @__PURE__ */ jsx27(Kbd, { children: "\u2193" }),
         " on any number (",
-        /* @__PURE__ */ jsx26(Kbd, { children: "\u21E7" }),
+        /* @__PURE__ */ jsx27(Kbd, { children: "\u21E7" }),
         " \xD710, ",
-        /* @__PURE__ */ jsx26(Kbd, { children: ALT }),
-        " \xD70.1), or drag a label sideways."
+        /* @__PURE__ */ jsx27(Kbd, { children: ALT }),
+        " \xD70.1)."
       ] }),
       /* @__PURE__ */ jsxs4("li", { children: [
         "Changes show at once. ",
-        /* @__PURE__ */ jsx26("b", { className: "text-foreground", children: "Save" }),
+        /* @__PURE__ */ jsx27("b", { className: "text-foreground", children: "Save" }),
         " (",
         /* @__PURE__ */ jsxs4(Kbd, { children: [
           MOD,
@@ -10345,11 +10473,20 @@ function Empty({ gone }) {
         ] }),
         ") writes them into the .css file the rule lives in."
       ] }),
-      /* @__PURE__ */ jsx26("li", { children: "Rules for other screen sizes are listed too: edit the phone layout from your desktop." })
+      /* @__PURE__ */ jsxs4("li", { children: [
+        "Change the words too: the ",
+        /* @__PURE__ */ jsx27("b", { className: "text-foreground", children: "Text" }),
+        " section saves new copy into the component it is written in."
+      ] }),
+      /* @__PURE__ */ jsxs4("li", { children: [
+        "Styles for other screen sizes are listed under ",
+        /* @__PURE__ */ jsx27("b", { className: "text-foreground", children: "All styles" }),
+        ": edit the phone layout from your desktop."
+      ] })
     ] })
   ] });
 }
-var TEXT_PROPS = ["font-size", "line-height", "font-weight", "letter-spacing", "text-align"];
+var TEXT_PROPS = ["font-size", "line-height", "font-weight", "letter-spacing", "text-align", "color"];
 function Inspector({ el }) {
   const version = useStore();
   const cas = useMemo10(() => cascade(el), [el, version]);
@@ -10363,18 +10500,18 @@ function Inspector({ el }) {
   for (let p = el.parentElement; p && p !== document.documentElement; p = p.parentElement) ancestors.unshift(p);
   return /* @__PURE__ */ jsxs4(Fragment3, { children: [
     /* @__PURE__ */ jsxs4("section", { className: "grid gap-1.5 border-b px-3 pt-2.5 pb-3", children: [
-      /* @__PURE__ */ jsx26("nav", { "aria-label": "Parents", className: "flex flex-wrap items-center gap-0.5 font-mono text-[10.5px] text-muted-foreground", children: ancestors.slice(-4).map((a, i) => /* @__PURE__ */ jsxs4("span", { className: "inline-flex items-center gap-0.5", children: [
-        /* @__PURE__ */ jsx26("button", { type: "button", className: "rounded px-1 py-0.5 hover:bg-accent hover:text-foreground", title: label(a), onClick: () => store.select(a), children: short(label(a), 22) }),
-        /* @__PURE__ */ jsx26(ChevronRight, { className: "size-3 opacity-50" })
+      /* @__PURE__ */ jsx27("nav", { "aria-label": "Parents", className: "flex flex-wrap items-center gap-0.5 font-mono text-[10.5px] text-muted-foreground", children: ancestors.slice(-4).map((a, i) => /* @__PURE__ */ jsxs4("span", { className: "inline-flex items-center gap-0.5", children: [
+        /* @__PURE__ */ jsx27("button", { type: "button", className: "rounded px-1 py-0.5 hover:bg-accent hover:text-foreground", title: label(a), onClick: () => store.select(a), children: short(label(a), 22) }),
+        /* @__PURE__ */ jsx27(ChevronRight, { className: "size-3 opacity-50" })
       ] }, i)) }),
       /* @__PURE__ */ jsxs4("div", { className: "flex items-center gap-2", children: [
-        /* @__PURE__ */ jsx26("code", { className: "min-w-0 flex-1 truncate font-mono text-[12.5px] font-medium text-primary", title: label(el), children: label(el) }),
+        /* @__PURE__ */ jsx27("code", { className: "min-w-0 flex-1 truncate font-mono text-[12.5px] font-medium text-primary", title: label(el), children: label(el) }),
         /* @__PURE__ */ jsxs4(Badge, { variant: "outline", className: "font-mono", children: [
           Math.round(r2.width),
           " \xD7 ",
           Math.round(r2.height)
         ] }),
-        /* @__PURE__ */ jsx26(Tip, { label: "Select the parent", children: /* @__PURE__ */ jsx26(
+        /* @__PURE__ */ jsx27(Tip, { label: "Select the parent", children: /* @__PURE__ */ jsx27(
           Button,
           {
             size: "icon-sm",
@@ -10382,10 +10519,10 @@ function Inspector({ el }) {
             "aria-label": "Parent",
             disabled: !el.parentElement || el.parentElement === document.documentElement,
             onClick: () => el.parentElement && store.select(el.parentElement),
-            children: /* @__PURE__ */ jsx26(ArrowUp, {})
+            children: /* @__PURE__ */ jsx27(ArrowUp, {})
           }
         ) }),
-        /* @__PURE__ */ jsx26(Tip, { label: "Select the first child", children: /* @__PURE__ */ jsx26(
+        /* @__PURE__ */ jsx27(Tip, { label: "Select the first child", children: /* @__PURE__ */ jsx27(
           Button,
           {
             size: "icon-sm",
@@ -10393,24 +10530,24 @@ function Inspector({ el }) {
             "aria-label": "First child",
             disabled: !el.children.length,
             onClick: () => el.children[0] && store.select(el.children[0]),
-            children: /* @__PURE__ */ jsx26(ArrowDown, {})
+            children: /* @__PURE__ */ jsx27(ArrowDown, {})
           }
         ) })
       ] }),
-      /* @__PURE__ */ jsxs4("div", { className: "font-mono text-[11px] text-muted-foreground", children: [
-        cs.fontSize,
-        " / ",
-        lineHeightRatio(cs),
+      /* @__PURE__ */ jsxs4("div", { className: "text-[11px] text-muted-foreground", children: [
+        px(cs.fontSize),
         " \xB7 ",
+        weightName(cs.fontWeight),
+        " ",
         cs.fontWeight,
-        " \xB7 ",
-        cs.display
+        " \xB7 line ",
+        lineHeightRatio(cs)
       ] }),
       cas.inline.length > 0 && /* @__PURE__ */ jsxs4("div", { className: "mt-1 flex gap-2 rounded-md border border-warning/30 bg-warning/10 p-2 text-[11px] text-warning", children: [
-        /* @__PURE__ */ jsx26(CircleExclamationPoint, { className: "mt-px size-3.5 shrink-0" }),
+        /* @__PURE__ */ jsx27(CircleExclamationPoint, { className: "mt-px size-3.5 shrink-0" }),
         /* @__PURE__ */ jsxs4("p", { children: [
           "An inline style (from the component, or set by a script such as an animation) beats the CSS: ",
-          /* @__PURE__ */ jsx26("code", { className: "font-mono text-foreground", children: cas.inline.map((d) => `${d.prop}: ${d.value}`).join("; ") })
+          /* @__PURE__ */ jsx27("code", { className: "font-mono text-foreground", children: cas.inline.map((d) => `${d.prop}: ${d.value}`).join("; ") })
         ] })
       ] })
     ] }),
@@ -10418,165 +10555,263 @@ function Inspector({ el }) {
       setTab(v);
       writeLocal(TAB_KEY, v);
     }, children: [
-      /* @__PURE__ */ jsx26("div", { className: "sticky top-0 z-10 border-b bg-background/95 px-3 py-2 backdrop-blur", children: /* @__PURE__ */ jsxs4(TabsList3, { className: "w-full", children: [
-        /* @__PURE__ */ jsx26(TabsTrigger3, { value: "design", children: "Design" }),
+      /* @__PURE__ */ jsx27("div", { className: "sticky top-0 z-10 border-b bg-background/95 px-3 py-2 backdrop-blur", children: /* @__PURE__ */ jsxs4(TabsList3, { className: "w-full", children: [
+        /* @__PURE__ */ jsx27(TabsTrigger3, { value: "design", children: "Design" }),
         /* @__PURE__ */ jsxs4(TabsTrigger3, { value: "rules", children: [
-          "Rules ",
-          /* @__PURE__ */ jsx26("span", { className: "text-muted-foreground tabular-nums", children: cas.matches.length })
+          "All styles ",
+          /* @__PURE__ */ jsx27("span", { className: "text-muted-foreground tabular-nums", children: cas.matches.length })
         ] })
       ] }) }),
-      /* @__PURE__ */ jsx26(TabsContent3, { value: "design", children: /* @__PURE__ */ jsx26(Quick, { el, cs, cas, target, editable, inherited }) }),
-      /* @__PURE__ */ jsxs4(TabsContent3, { value: "rules", className: "grid grid-cols-[minmax(0,1fr)] gap-2 p-3", children: [
-        /* @__PURE__ */ jsxs4("div", { className: "flex items-center justify-between", children: [
-          /* @__PURE__ */ jsx26(SectionTitle, { children: "Every rule for this element" }),
-          /* @__PURE__ */ jsx26(NewRule, { el, cas })
-        ] }),
-        cas.matches.length === 0 && /* @__PURE__ */ jsx26("p", { className: "text-muted-foreground", children: "No rule in the project's CSS matches it." }),
-        cas.matches.map((m) => /* @__PURE__ */ jsx26(RuleCard, { m, cas, isTarget: m === target }, m.live.key))
-      ] })
+      /* @__PURE__ */ jsxs4(TabsContent3, { value: "design", children: [
+        /* @__PURE__ */ jsx27(TextSection, { el }),
+        /* @__PURE__ */ jsx27(Quick, { el, cs, cas, target, editable, inherited })
+      ] }),
+      /* @__PURE__ */ jsx27(TabsContent3, { value: "rules", children: /* @__PURE__ */ jsx27(AllStyles, { el, cas, target }) })
     ] })
   ] });
 }
-var SHORT_LABEL = {
-  "font-size": "Size",
-  "line-height": "Line",
-  "font-weight": "Weight",
-  "letter-spacing": "Tracking",
-  "max-width": "Max W",
-  width: "Width"
-};
 var short = (s, n = 26) => s.length > n ? s.slice(0, n - 1) + "\u2026" : s;
 var px = (v) => `${Math.round(parseFloat(v) * 10) / 10 || 0}px`;
 function lineHeightRatio(cs) {
   const lh = parseFloat(cs.lineHeight), fs = parseFloat(cs.fontSize);
   return lh && fs ? String(Math.round(lh / fs * 100) / 100) : cs.lineHeight;
 }
+var squash2 = (s) => s.replace(/\s+/g, " ").trim();
 function SectionTitle({ children, className }) {
-  return /* @__PURE__ */ jsx26("h3", { className: cn("text-[10px] font-semibold tracking-wider text-muted-foreground uppercase", className), children });
+  return /* @__PURE__ */ jsx27("h3", { className: cn("text-[10px] font-semibold tracking-wider text-muted-foreground uppercase", className), children });
 }
 function Section({ title, aside, children }) {
-  return /* @__PURE__ */ jsxs4("section", { className: "grid gap-2.5 border-b px-3 py-3 last:border-b-0", children: [
+  return /* @__PURE__ */ jsxs4("section", { className: "grid gap-3 border-b px-3 py-3 last:border-b-0", children: [
     /* @__PURE__ */ jsxs4("div", { className: "flex min-h-5 items-center justify-between gap-2", children: [
-      /* @__PURE__ */ jsx26(SectionTitle, { children: title }),
+      /* @__PURE__ */ jsx27(SectionTitle, { children: title }),
       aside
     ] }),
     children
   ] });
 }
+function Row({ label: label2, title, note, children }) {
+  return /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-[60px_minmax(0,1fr)] items-start gap-x-2", children: [
+    /* @__PURE__ */ jsx27("span", { className: "truncate leading-7 text-muted-foreground", title, children: label2 }),
+    /* @__PURE__ */ jsxs4("div", { className: "grid min-w-0 gap-1.5", children: [
+      children,
+      note
+    ] })
+  ] });
+}
+function textNodesOf(el) {
+  const own = Array.from(el.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE && wordy(n.data));
+  if (own.length) return own;
+  const out = [];
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => wordy(n.data) && !n.parentElement?.closest("script,style,noscript,svg,template") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+  });
+  while (walker.nextNode() && out.length < 50) out.push(walker.currentNode);
+  return out;
+}
+var MAX_TEXTS = 6;
+var ids = /* @__PURE__ */ new WeakMap();
+var nextId = 0;
+var nodeId = (n) => ids.get(n) ?? (ids.set(n, ++nextId), nextId);
+var wordy = (t) => /[\p{L}\p{N}]/u.test(t);
+function TextSection({ el }) {
+  useStore();
+  const nodes = useMemo10(() => textNodesOf(el), [el]);
+  const shown = nodes.slice(0, MAX_TEXTS);
+  useEffect14(() => {
+    void store.findPlaces(shown.map((n) => store.texts.get(n)?.original ?? n.data));
+  }, [el]);
+  if (!nodes.length) return null;
+  return /* @__PURE__ */ jsxs4(Section, { title: "Text", aside: /* @__PURE__ */ jsx27("span", { className: "text-[10.5px] text-muted-foreground", children: "saved into the code" }), children: [
+    shown.map((n) => /* @__PURE__ */ jsx27(TextRow, { node: n, label: n.parentElement !== el ? label(n.parentElement) : void 0 }, nodeId(n))),
+    nodes.length > MAX_TEXTS && /* @__PURE__ */ jsxs4("p", { className: "text-[11px] text-muted-foreground", children: [
+      nodes.length - MAX_TEXTS,
+      " more inside: select the text itself to change it."
+    ] })
+  ] });
+}
+function TextRow({ node, label: where }) {
+  const c = store.texts.get(node);
+  const original = squash2(c?.original ?? node.data);
+  const current = c ? c.after : original;
+  const [draft, setDraft] = useState15(current);
+  const focused = useRef17(false);
+  useEffect14(() => {
+    if (!focused.current) setDraft(current);
+  }, [current]);
+  const places = store.places.get(original);
+  const fromData = Array.isArray(places) && places.length === 0;
+  const place = c?.at ?? (Array.isArray(places) && places.length === 1 ? places[0] : void 0);
+  return /* @__PURE__ */ jsxs4("div", { className: "grid gap-1.5", children: [
+    where && /* @__PURE__ */ jsx27("span", { className: "font-mono text-[10.5px] text-muted-foreground", children: short(where, 40) }),
+    /* @__PURE__ */ jsx27(
+      Textarea,
+      {
+        value: draft,
+        disabled: fromData,
+        "aria-label": "Text",
+        rows: Math.min(5, Math.max(1, Math.ceil(draft.length / 42))),
+        onFocus: () => {
+          focused.current = true;
+        },
+        onBlur: () => {
+          focused.current = false;
+          setDraft(current);
+        },
+        onChange: (e) => {
+          setDraft(e.target.value);
+          store.setText(node, e.target.value);
+        },
+        onKeyDown: (e) => {
+          if (e.key === "Escape") {
+            e.stopPropagation();
+            store.revertText(node);
+            e.target.blur();
+          }
+        }
+      }
+    ),
+    /* @__PURE__ */ jsxs4("div", { className: "flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground", children: [
+      places === "looking" && /* @__PURE__ */ jsx27("span", { children: "Looking for it in the code\u2026" }),
+      fromData && /* @__PURE__ */ jsxs4("span", { className: "inline-flex items-center gap-1", children: [
+        /* @__PURE__ */ jsx27(Database, { className: "size-3" }),
+        " Not written in the code: it comes from data, so change it where the data lives."
+      ] }),
+      place && /* @__PURE__ */ jsx27(Tip, { label: "Open in your code editor", children: /* @__PURE__ */ jsxs4(Button, { variant: "link", size: "sm", className: "h-auto gap-1 font-mono text-[10.5px]", onClick: () => openInEditor(place.file, place.line), children: [
+        /* @__PURE__ */ jsx27(FileCode, { className: "size-3" }),
+        shortFile(place.file),
+        ":",
+        place.line
+      ] }) }),
+      !c?.at && Array.isArray(places) && places.length > 1 && !c?.choices && /* @__PURE__ */ jsxs4("span", { children: [
+        "Written in ",
+        places.length,
+        " places: you choose which when you save."
+      ] }),
+      c && /* @__PURE__ */ jsxs4(Button, { variant: "ghost", size: "sm", className: "ml-auto h-5 px-1.5", onClick: () => store.revertText(node), children: [
+        /* @__PURE__ */ jsx27(Undo2, { className: "size-3" }),
+        " Undo"
+      ] })
+    ] }),
+    c?.choices && /* @__PURE__ */ jsxs4("div", { className: "grid gap-1 rounded-md border border-warning/30 bg-warning/10 p-2 text-[11px]", children: [
+      /* @__PURE__ */ jsxs4("span", { className: "text-warning", children: [
+        "This text is written in ",
+        c.choices.length,
+        " places. Which one is this?"
+      ] }),
+      c.choices.map((pl) => /* @__PURE__ */ jsxs4(Button, { variant: "outline", size: "sm", className: "justify-start font-mono", onClick: () => store.chooseTextPlace(node, pl), children: [
+        shortFile(pl.file),
+        ":",
+        pl.line
+      ] }, `${pl.file}:${pl.line}`))
+    ] })
+  ] });
+}
+function ruleLabel(m) {
+  const n = countMatches(withoutStates(m.live.rule.selectorText));
+  const when = m.live.conds.length ? ` \xB7 ${describeCondition(conditionLabel(m.live))}` : "";
+  return `${m.live.rule.selectorText}  \xB7  ${n} element${n === 1 ? "" : "s"}${when}${m.active ? "" : " (not at this width)"}`;
+}
 function Quick({ el, cs, cas, target, editable, inherited }) {
   const key = target?.live.key ?? null;
   const decls = key ? store.declsOf(key) : [];
   const write = (fn) => key && store.setDecls(key, fn(store.declsOf(key)));
+  const set = (prop) => (v) => write((d) => writeProp(d, prop, v));
   const rank = (k) => k === "inline" ? -1 : cas.matches.findIndex((m) => m.live.key === k);
   const overriddenBy = (longhand) => {
     const w = cas.winner.get(longhand);
     if (!w || !key || w === key || rank(w) > rank(key)) return null;
     return w;
   };
+  const note = (prop, longhand = prop) => /* @__PURE__ */ jsx27(Note, { prop, over: overriddenBy(longhand), from: readProp(decls, prop) ? null : inherited.get(prop) ?? null });
   const isBox = /flex|grid/.test(cs.display);
-  const field = (prop, placeholder) => /* @__PURE__ */ jsx26(
-    Field,
-    {
-      label: SHORT_LABEL[prop] ?? prop,
-      prop,
-      value: readProp(decls, prop) ?? "",
-      placeholder,
-      disabled: !key,
-      onChange: (v) => write((d) => writeProp(d, prop, v)),
-      onClear: () => write((d) => writeProp(d, prop, null)),
-      note: /* @__PURE__ */ jsx26(Note, { prop, over: overriddenBy(prop), from: readProp(decls, prop) ? null : inherited.get(prop) ?? null })
-    },
-    prop
-  );
   if (!target) {
     return /* @__PURE__ */ jsxs4("div", { className: "p-3 text-muted-foreground", children: [
-      "No editable rule targets this element yet. Add one under ",
-      /* @__PURE__ */ jsx26("b", { className: "text-foreground", children: "Rules \u2192 New rule" }),
+      "No style rule in your CSS targets this element yet. Add one under ",
+      /* @__PURE__ */ jsx27("b", { className: "text-foreground", children: "All styles \u2192 New style" }),
       ", or select a parent."
     ] });
   }
   return /* @__PURE__ */ jsxs4(Fragment3, { children: [
-    /* @__PURE__ */ jsxs4(Section, { title: "Rule", children: [
-      /* @__PURE__ */ jsx26(NativeSelect, { "aria-label": "Rule the controls edit", value: key, onChange: (e) => {
+    /* @__PURE__ */ jsxs4(Section, { title: "Changes apply to", children: [
+      /* @__PURE__ */ jsx27(NativeSelect, { "aria-label": "Rule the controls edit", value: key, onChange: (e) => {
         store.target = e.target.value;
         store.emit();
-      }, children: editable.map((m) => /* @__PURE__ */ jsxs4("option", { value: m.live.key, children: [
-        m.live.rule.selectorText,
-        m.live.conds.length ? `  @${conditionLabel(m.live).replace(/^@media /, "")}` : "",
-        m.active ? "" : " (inactive)"
-      ] }, m.live.key)) }),
-      /* @__PURE__ */ jsx26(RuleMeta, { m: target })
+      }, children: editable.map((m) => /* @__PURE__ */ jsx27("option", { value: m.live.key, children: ruleLabel(m) }, m.live.key)) }),
+      /* @__PURE__ */ jsx27(RuleMeta, { m: target })
     ] }),
     /* @__PURE__ */ jsxs4(Section, { title: "Typography", children: [
-      /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-2 items-start gap-x-3 gap-y-2", children: [
-        field("font-size", px(cs.fontSize)),
-        field("line-height", lineHeightRatio(cs)),
-        field("font-weight", cs.fontWeight),
-        field("letter-spacing", cs.letterSpacing === "normal" ? "0em" : cs.letterSpacing)
-      ] }),
-      /* @__PURE__ */ jsx26(
-        Align,
+      /* @__PURE__ */ jsx27(Row, { label: "Size", title: "font-size", note: note("font-size"), children: /* @__PURE__ */ jsx27(FontSize, { value: readProp(decls, "font-size"), cs, onChange: set("font-size") }) }),
+      /* @__PURE__ */ jsx27(Row, { label: "Weight", title: "font-weight", note: note("font-weight"), children: /* @__PURE__ */ jsx27(Weight, { value: readProp(decls, "font-weight"), computed: cs.fontWeight, onChange: set("font-weight") }) }),
+      /* @__PURE__ */ jsx27(Row, { label: "Line", title: "line-height: the space between lines", note: note("line-height"), children: /* @__PURE__ */ jsx27(
+        Stepper,
         {
-          declared: readProp(decls, "text-align"),
-          computed: cs.textAlign === "start" ? "left" : cs.textAlign,
-          onPick: (v) => write((d) => writeProp(d, "text-align", v))
+          prop: "line-height",
+          value: readProp(decls, "line-height") ?? "",
+          placeholder: lineHeightRatio(cs),
+          onChange: set("line-height"),
+          presets: [["Tight", "1.1"], ["Snug", "1.3"], ["Normal", "1.5"], ["Loose", "1.7"]]
         }
-      )
+      ) }),
+      /* @__PURE__ */ jsx27(Row, { label: "Spacing", title: "letter-spacing: the space between letters", note: note("letter-spacing"), children: /* @__PURE__ */ jsx27(
+        Stepper,
+        {
+          prop: "letter-spacing",
+          value: readProp(decls, "letter-spacing") ?? "",
+          onChange: set("letter-spacing"),
+          placeholder: cs.letterSpacing === "normal" ? "0em" : cs.letterSpacing
+        }
+      ) }),
+      /* @__PURE__ */ jsx27(Row, { label: "Color", title: "color", note: note("color"), children: /* @__PURE__ */ jsx27(ColorField, { prop: "color", value: readProp(decls, "color"), computed: cs.color, onChange: set("color") }) }),
+      /* @__PURE__ */ jsx27(Row, { label: "Align", title: "text-align", children: /* @__PURE__ */ jsx27(Align, { declared: readProp(decls, "text-align"), computed: cs.textAlign === "start" ? "left" : cs.textAlign, onPick: set("text-align") }) })
     ] }),
     /* @__PURE__ */ jsxs4(Section, { title: "Spacing", children: [
-      /* @__PURE__ */ jsx26(BoxModel, { el, cs, decls, write, overriddenBy }),
-      (isBox || readProp(decls, "gap")) && /* @__PURE__ */ jsx26("div", { className: "grid grid-cols-2 gap-x-3", children: /* @__PURE__ */ jsx26(
-        Field,
+      /* @__PURE__ */ jsx27(BoxModel, { el, cs, decls, write, overriddenBy }),
+      (isBox || readProp(decls, "gap")) && /* @__PURE__ */ jsx27(Row, { label: "Gap", title: "gap: the space between items", note: note("gap", "row-gap"), children: /* @__PURE__ */ jsx27(
+        Stepper,
         {
-          label: "Gap",
           prop: "gap",
           value: readProp(decls, "gap") ?? "",
-          disabled: !key,
-          placeholder: cs.rowGap === cs.columnGap ? px(cs.rowGap) : `${px(cs.rowGap)} ${px(cs.columnGap)}`,
-          onChange: (v) => write((d) => writeProp(d, "gap", v)),
-          onClear: () => write((d) => writeProp(d, "gap", null)),
-          note: /* @__PURE__ */ jsx26(Note, { prop: "gap", over: overriddenBy("row-gap"), from: null })
+          onChange: set("gap"),
+          placeholder: cs.rowGap === cs.columnGap ? px(cs.rowGap) : `${px(cs.rowGap)} ${px(cs.columnGap)}`
         }
       ) })
     ] }),
-    isBox && /* @__PURE__ */ jsx26(Section, { title: `Layout \xB7 ${cs.display}`, children: /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-2 gap-x-3 gap-y-2", children: [
-      /* @__PURE__ */ jsx26(
+    isBox && /* @__PURE__ */ jsxs4(Section, { title: `Layout \xB7 ${cs.display}`, children: [
+      /* @__PURE__ */ jsx27(Row, { label: "Justify", title: "justify-content: along the main direction", children: /* @__PURE__ */ jsx27(
         Choice,
         {
-          label: "Justify",
           prop: "justify-content",
           decls,
           write,
           computed: cs.justifyContent,
           options: ["normal", "flex-start", "center", "flex-end", "space-between", "space-around", "space-evenly", "stretch"]
         }
-      ),
-      /* @__PURE__ */ jsx26(
+      ) }),
+      /* @__PURE__ */ jsx27(Row, { label: "Align", title: "align-items: across the main direction", children: /* @__PURE__ */ jsx27(
         Choice,
         {
-          label: "Align",
           prop: "align-items",
           decls,
           write,
           computed: cs.alignItems,
           options: ["normal", "stretch", "flex-start", "center", "flex-end", "baseline"]
         }
-      )
-    ] }) }),
-    /* @__PURE__ */ jsx26(Section, { title: "Size", children: /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-2 gap-x-3 gap-y-2", children: [
-      field("max-width", cs.maxWidth),
-      field("width", px(cs.width))
-    ] }) })
+      ) })
+    ] }),
+    /* @__PURE__ */ jsxs4(Section, { title: "Size", children: [
+      /* @__PURE__ */ jsx27(Row, { label: "Width", title: "width", note: note("width"), children: /* @__PURE__ */ jsx27(Stepper, { prop: "width", value: readProp(decls, "width") ?? "", placeholder: px(cs.width), onChange: set("width") }) }),
+      /* @__PURE__ */ jsx27(Row, { label: "Max width", title: "max-width", note: note("max-width"), children: /* @__PURE__ */ jsx27(Stepper, { prop: "max-width", value: readProp(decls, "max-width") ?? "", placeholder: cs.maxWidth, onChange: set("max-width") }) })
+    ] })
   ] });
 }
 function Note({ prop, over, from }) {
   if (over) {
-    const sel = over === "inline" ? "an inline style" : store.sources.get(over)?.selector ?? "another rule";
-    return /* @__PURE__ */ jsx26(Tip, { label: `A stronger rule sets ${prop}, so edits here will not show.${over === "inline" ? "" : " Click to edit that rule instead."}`, children: /* @__PURE__ */ jsxs4(
+    const sel = over === "inline" ? "an inline style" : store.sources.get(over)?.selector ?? "another style";
+    return /* @__PURE__ */ jsx27(Tip, { label: `A stronger style sets ${prop}, so changes here will not show.${over === "inline" ? "" : " Click to edit that one instead."}`, children: /* @__PURE__ */ jsxs4(
       "button",
       {
         type: "button",
-        className: "col-start-2 justify-self-start truncate text-left text-[10.5px] text-warning hover:underline",
+        className: "justify-self-start truncate text-left text-[10.5px] text-warning hover:underline",
         onClick: () => {
           if (over !== "inline") {
             store.target = over;
@@ -10585,21 +10820,21 @@ function Note({ prop, over, from }) {
         },
         children: [
           "overridden by ",
-          short(sel, 22)
+          short(sel, 28)
         ]
       }
     ) });
   }
   if (from) {
-    return /* @__PURE__ */ jsx26(Tip, { label: "Inherited. Click to select the element it comes from.", children: /* @__PURE__ */ jsxs4(
+    return /* @__PURE__ */ jsx27(Tip, { label: "Inherited from a parent. Click to select it.", children: /* @__PURE__ */ jsxs4(
       "button",
       {
         type: "button",
-        className: "col-start-2 justify-self-start truncate text-left text-[10.5px] text-muted-foreground hover:text-foreground hover:underline",
+        className: "justify-self-start truncate text-left text-[10.5px] text-muted-foreground hover:text-foreground hover:underline",
         onClick: () => store.select(from.el),
         children: [
           "from ",
-          short(store.sources.get(from.key)?.selector ?? label(from.el), 22)
+          short(store.sources.get(from.key)?.selector ?? label(from.el), 28)
         ]
       }
     ) });
@@ -10608,20 +10843,9 @@ function Note({ prop, over, from }) {
 }
 function RuleMeta({ m }) {
   const src = m.live.source;
-  const count2 = useMemo10(() => countMatches(m.live.rule.selectorText), [m.live.rule.selectorText]);
+  const count2 = useMemo10(() => countMatches(withoutStates(m.live.rule.selectorText)), [m.live.rule.selectorText]);
   return /* @__PURE__ */ jsxs4("div", { className: "flex flex-wrap items-center gap-1.5", children: [
-    src && /* @__PURE__ */ jsx26(Tip, { label: "Open in your code editor", children: /* @__PURE__ */ jsxs4(Button, { variant: "link", size: "sm", className: "h-5 gap-1 font-mono text-[11px]", onClick: () => openInEditor(src.file, src.line), children: [
-      /* @__PURE__ */ jsx26(FileCode, { className: "size-3" }),
-      shortFile(src.file),
-      ":",
-      src.line
-    ] }) }),
-    m.live.conds.length > 0 && /* @__PURE__ */ jsxs4(Badge, { variant: m.active ? "secondary" : "warning", className: "font-mono", children: [
-      conditionLabel(m.live),
-      m.active ? "" : " \xB7 not at this width"
-    ] }),
-    m.state && /* @__PURE__ */ jsx26(Badge, { variant: "warning", className: "font-mono", children: m.state }),
-    /* @__PURE__ */ jsx26(Tip, { label: "Every element this rule styles on the page: hover to outline them", children: /* @__PURE__ */ jsxs4(
+    /* @__PURE__ */ jsx27(Tip, { label: "Every element this style applies to: hover to outline them on the page", children: /* @__PURE__ */ jsxs4(
       Badge,
       {
         variant: "outline",
@@ -10638,9 +10862,21 @@ function RuleMeta({ m }) {
           count2 === 1 ? "" : "s"
         ]
       }
-    ) })
+    ) }),
+    m.live.conds.length > 0 && /* @__PURE__ */ jsx27(Tip, { label: conditionLabel(m.live), children: /* @__PURE__ */ jsxs4(Badge, { variant: m.active ? "secondary" : "warning", children: [
+      describeCondition(conditionLabel(m.live)),
+      m.active ? "" : " \xB7 not now"
+    ] }) }),
+    m.state && /* @__PURE__ */ jsx27(Badge, { variant: "warning", children: describeState(m.state) }),
+    src && /* @__PURE__ */ jsx27(Tip, { label: "Open in your code editor", children: /* @__PURE__ */ jsxs4(Button, { variant: "link", size: "sm", className: "h-5 gap-1 font-mono text-[10.5px] text-muted-foreground hover:text-primary", onClick: () => openInEditor(src.file, src.line), children: [
+      /* @__PURE__ */ jsx27(FileCode, { className: "size-3" }),
+      shortFile(src.file),
+      ":",
+      src.line
+    ] }) })
   ] });
 }
+var withoutStates = (selector) => selector.replace(/::?(hover|focus-visible|focus-within|focus|active|visited|before|after|placeholder|marker|selection|first-line|first-letter)\b/g, "").replace(/(^|,)\s*(?=,|$)/g, "$1*") || "*";
 function countMatches(selector) {
   try {
     return document.querySelectorAll(selector).length;
@@ -10662,7 +10898,7 @@ function BoxModel({ el, cs, decls, write, overriddenBy }) {
   const side = (base, s) => {
     const prop = `${base}-${s}`;
     const over = overriddenBy(prop);
-    return /* @__PURE__ */ jsx26(
+    return /* @__PURE__ */ jsx27(
       ValueInput,
       {
         prop,
@@ -10675,7 +10911,7 @@ function BoxModel({ el, cs, decls, write, overriddenBy }) {
       }
     );
   };
-  const ring = (base) => /* @__PURE__ */ jsx26(Tip, { label: linked[base] ? `Editing all four ${base} sides together` : `Set all four ${base} sides together`, children: /* @__PURE__ */ jsxs4(
+  const ring = (base) => /* @__PURE__ */ jsx27(Tip, { label: linked[base] ? `Editing all four ${base} sides together` : `Set all four ${base} sides together`, children: /* @__PURE__ */ jsxs4(
     "button",
     {
       type: "button",
@@ -10688,17 +10924,17 @@ function BoxModel({ el, cs, decls, write, overriddenBy }) {
       children: [
         base,
         " ",
-        /* @__PURE__ */ jsx26(Link2, { className: "size-3" })
+        /* @__PURE__ */ jsx27(Link2, { className: "size-3" })
       ]
     }
   ) });
   const grid = "relative grid grid-cols-[56px_minmax(0,1fr)_56px] grid-rows-[32px_auto_32px] items-center justify-items-center rounded-md";
   return /* @__PURE__ */ jsxs4("div", { className: cn(grid, "border border-dashed border-box-margin bg-box-margin"), children: [
     ring("margin"),
-    SIDES.map((s) => /* @__PURE__ */ jsx26("span", { className: SLOT[s], children: side("margin", s) }, s)),
+    SIDES.map((s) => /* @__PURE__ */ jsx27("span", { className: SLOT[s], children: side("margin", s) }, s)),
     /* @__PURE__ */ jsxs4("div", { className: cn(grid, "col-start-2 row-start-2 w-full border border-box-padding bg-box-padding"), children: [
       ring("padding"),
-      SIDES.map((s) => /* @__PURE__ */ jsx26("span", { className: SLOT[s], children: side("padding", s) }, s)),
+      SIDES.map((s) => /* @__PURE__ */ jsx27("span", { className: SLOT[s], children: side("padding", s) }, s)),
       /* @__PURE__ */ jsxs4("div", { className: "col-start-2 row-start-2 m-0.5 w-[calc(100%-4px)] rounded border border-box-content bg-box-content px-1 py-2 text-center font-mono text-[11px]", children: [
         Math.round(r2.width - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - parseFloat(cs.borderLeftWidth) - parseFloat(cs.borderRightWidth)),
         " \xD7 ",
@@ -10723,7 +10959,7 @@ function ValueInput({ prop, value, placeholder, onChange, onClear, className, ti
     setDraft(v);
     if (v.trim()) onChange(v.trim());
   };
-  return /* @__PURE__ */ jsx26(
+  return /* @__PURE__ */ jsx27(
     Input,
     {
       className: cn(value ? "text-foreground" : "text-muted-foreground", className),
@@ -10762,100 +10998,348 @@ function ValueInput({ prop, value, placeholder, onChange, onClear, className, ti
     }
   );
 }
-function Field({ label: label2, prop, value, placeholder, onChange, onClear, note, disabled }) {
-  const drag = useRef17(null);
-  return /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-[52px_minmax(0,1fr)] items-start gap-x-2 gap-y-0.5", children: [
-    /* @__PURE__ */ jsx26(
-      "span",
+var SIZE_PRESETS = [12, 14, 16, 18, 20, 24, 32, 40, 48, 64];
+function rootPx() {
+  return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+}
+var fmt = (n) => String(Math.round(n * 1e3) / 1e3);
+function FontSize({ value, cs, onChange }) {
+  const now = parseFloat(cs.fontSize);
+  const clamp2 = value ? parseClamp(value) : null;
+  const rem = !!value && /^[\d.]+rem$/.test(value.trim());
+  const sized = (n) => rem ? `${fmt(n / rootPx())}rem` : `${Math.round(n)}px`;
+  if (clamp2) {
+    return /* @__PURE__ */ jsxs4("div", { className: "grid min-w-0 gap-2 rounded-md border bg-card p-2", children: [
+      /* @__PURE__ */ jsxs4("div", { className: "flex min-w-0 items-center gap-2", children: [
+        /* @__PURE__ */ jsx27(Badge, { children: "Responsive" }),
+        /* @__PURE__ */ jsxs4("span", { className: "min-w-0 truncate text-[10.5px] text-muted-foreground", title: value, children: [
+          "now ",
+          Math.round(now),
+          "px here"
+        ] }),
+        /* @__PURE__ */ jsx27(Tip, { label: `Use one size everywhere (${Math.round(now)}px)`, children: /* @__PURE__ */ jsx27(Button, { variant: "link", size: "sm", className: "ml-auto h-auto text-[10.5px]", onClick: () => onChange(`${Math.round(now)}px`), children: "Make fixed" }) })
+      ] }),
+      /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-[52px_minmax(0,1fr)] items-center gap-x-2 gap-y-1.5 text-[11px] text-muted-foreground", children: [
+        /* @__PURE__ */ jsx27("span", { children: "Smallest" }),
+        /* @__PURE__ */ jsx27(Stepper, { prop: "font-size", value: clamp2[0], onChange: (v) => v && onChange(composeClamp([v, clamp2[1], clamp2[2]])) }),
+        /* @__PURE__ */ jsx27("span", { children: "Largest" }),
+        /* @__PURE__ */ jsx27(Stepper, { prop: "font-size", value: clamp2[2], onChange: (v) => v && onChange(composeClamp([clamp2[0], clamp2[1], v])) })
+      ] }),
+      /* @__PURE__ */ jsxs4("span", { className: "text-[10.5px] text-muted-foreground", children: [
+        "Grows with the screen in between (",
+        clamp2[1],
+        ")."
+      ] })
+    ] });
+  }
+  return /* @__PURE__ */ jsxs4("div", { className: "grid gap-1.5", children: [
+    /* @__PURE__ */ jsx27(Stepper, { prop: "font-size", value: value ?? "", placeholder: px(cs.fontSize), onChange }),
+    /* @__PURE__ */ jsx27(
+      "input",
       {
-        className: "cursor-ew-resize truncate leading-7 text-muted-foreground select-none hover:text-primary",
-        style: { touchAction: "none" },
-        title: `${prop}: drag sideways to change (Shift \xD710, Alt \xD70.1)`,
-        onPointerDown: (e) => {
-          if (disabled) return;
-          e.currentTarget.setPointerCapture(e.pointerId);
-          drag.current = { x: e.clientX, base: value || placeholder };
-        },
-        onPointerMove: (e) => {
-          const d = drag.current;
-          if (!d) return;
-          const steps = Math.round((e.clientX - d.x) / 3) * (e.shiftKey ? 10 : e.altKey ? 0.1 : 1);
-          const r2 = steps ? nudge(d.base, 0, steps, prop) : null;
-          if (r2) onChange(r2.value);
-        },
-        onPointerUp: () => {
-          drag.current = null;
-        },
-        children: label2
+        type: "range",
+        min: 8,
+        max: 120,
+        step: 1,
+        value: Math.round(now),
+        "aria-label": "Font size",
+        className: "h-4 w-full cursor-pointer accent-primary",
+        onChange: (e) => onChange(sized(Number(e.target.value)))
       }
     ),
-    /* @__PURE__ */ jsx26(ValueInput, { prop, value, placeholder, onChange, onClear, disabled }),
-    note
+    /* @__PURE__ */ jsx27("div", { className: "flex flex-wrap gap-1", children: SIZE_PRESETS.map((n) => /* @__PURE__ */ jsx27(
+      "button",
+      {
+        type: "button",
+        onClick: () => onChange(sized(n)),
+        className: cn(
+          "h-5 min-w-7 rounded-sm border px-1 font-mono text-[10.5px] tabular-nums text-muted-foreground hover:bg-accent hover:text-foreground",
+          Math.round(now) === n && "border-primary bg-primary/15 text-foreground"
+        ),
+        children: n
+      },
+      n
+    )) })
+  ] });
+}
+function Weight({ value, computed, onChange }) {
+  const custom = value && !WEIGHT_NAMES.some(([n2]) => String(n2) === value) ? value : null;
+  const n = Number(value ?? computed);
+  const step = (dir) => {
+    const next = dir > 0 ? (Math.floor(n / 100) + 1) * 100 : (Math.ceil(n / 100) - 1) * 100;
+    onChange(String(Math.min(900, Math.max(100, next))));
+  };
+  return /* @__PURE__ */ jsxs4("div", { className: "flex gap-1", children: [
+    /* @__PURE__ */ jsx27(Button, { variant: "outline", size: "icon", "aria-label": "Lighter", disabled: n <= 100, onClick: () => step(-1), children: /* @__PURE__ */ jsx27(Minus, {}) }),
+    /* @__PURE__ */ jsxs4(
+      NativeSelect,
+      {
+        "aria-label": "font-weight",
+        value: value ?? "",
+        className: value ? "font-sans" : "font-sans text-muted-foreground",
+        onChange: (e) => onChange(e.target.value || null),
+        children: [
+          /* @__PURE__ */ jsxs4("option", { value: "", children: [
+            weightName(computed),
+            " \xB7 ",
+            computed,
+            value ? " (remove)" : ""
+          ] }),
+          custom && /* @__PURE__ */ jsxs4("option", { value: custom, children: [
+            weightName(custom),
+            " \xB7 ",
+            custom
+          ] }),
+          WEIGHT_NAMES.map(([w, name]) => /* @__PURE__ */ jsxs4("option", { value: String(w), children: [
+            name,
+            " \xB7 ",
+            w
+          ] }, w))
+        ]
+      }
+    ),
+    /* @__PURE__ */ jsx27(Button, { variant: "outline", size: "icon", "aria-label": "Bolder", disabled: n >= 900, onClick: () => step(1), children: /* @__PURE__ */ jsx27(Plus, {}) })
+  ] });
+}
+function Stepper({ prop, value, placeholder, onChange, presets, disabled }) {
+  const bump = (dir) => {
+    const r2 = nudge(value || placeholder || "0", 0, dir, prop);
+    if (r2) onChange(r2.value);
+  };
+  return /* @__PURE__ */ jsxs4("div", { className: "grid gap-1", children: [
+    /* @__PURE__ */ jsxs4("div", { className: "flex gap-1", children: [
+      /* @__PURE__ */ jsx27(Button, { variant: "outline", size: "icon", "aria-label": `Less ${prop}`, disabled, onClick: () => bump(-1), children: /* @__PURE__ */ jsx27(Minus, {}) }),
+      /* @__PURE__ */ jsx27(
+        ValueInput,
+        {
+          prop,
+          value,
+          placeholder,
+          disabled,
+          className: "text-center",
+          onChange: (v) => onChange(v),
+          onClear: () => onChange(null)
+        }
+      ),
+      /* @__PURE__ */ jsx27(Button, { variant: "outline", size: "icon", "aria-label": `More ${prop}`, disabled, onClick: () => bump(1), children: /* @__PURE__ */ jsx27(Plus, {}) })
+    ] }),
+    presets && /* @__PURE__ */ jsx27("div", { className: "flex flex-wrap gap-1", children: presets.map(([name, v]) => /* @__PURE__ */ jsx27(
+      "button",
+      {
+        type: "button",
+        onClick: () => onChange(v),
+        title: `${prop}: ${v}`,
+        className: cn(
+          "h-5 rounded-sm border px-1.5 text-[10.5px] text-muted-foreground hover:bg-accent hover:text-foreground",
+          (value || placeholder) === v && "border-primary bg-primary/15 text-foreground"
+        ),
+        children: name
+      },
+      v
+    )) })
+  ] });
+}
+function ColorField({ prop, value, computed, onChange }) {
+  return /* @__PURE__ */ jsxs4("div", { className: "flex gap-1", children: [
+    /* @__PURE__ */ jsx27(Tip, { label: "Pick a colour", children: /* @__PURE__ */ jsx27("label", { className: "relative size-7 shrink-0 cursor-pointer overflow-hidden rounded-md border shadow-xs", style: { background: computed }, children: /* @__PURE__ */ jsx27(
+      "input",
+      {
+        type: "color",
+        "aria-label": `${prop} picker`,
+        value: toHex(computed),
+        onChange: (e) => onChange(e.target.value),
+        className: "absolute inset-0 size-full cursor-pointer opacity-0"
+      }
+    ) }) }),
+    /* @__PURE__ */ jsx27(ValueInput, { prop, value: value ?? "", placeholder: toHex(computed), onChange: (v) => onChange(v), onClear: () => onChange(null) })
   ] });
 }
 var ALIGN_ICONS = { left: TextAlignStart, center: TextAlignCenter, right: TextAlignEnd, justify: TextAlignJustify };
 function Align({ declared, computed, onPick }) {
-  return /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-[52px_minmax(0,1fr)] items-center gap-x-2", children: [
-    /* @__PURE__ */ jsx26("span", { className: "text-muted-foreground", children: "Align" }),
-    /* @__PURE__ */ jsx26(ToggleGroup3, { type: "single", "aria-label": "text-align", value: declared ?? "", onValueChange: (v) => onPick(v || null), children: Object.entries(ALIGN_ICONS).map(([o, Icon2]) => /* @__PURE__ */ jsx26(Tip, { label: declared === o ? `Remove text-align: ${o} from this rule` : `text-align: ${o}${!declared && computed === o ? " (current)" : ""}`, children: /* @__PURE__ */ jsx26(ToggleGroupItem3, { value: o, "aria-label": o, "data-soft": !declared && computed === o, children: /* @__PURE__ */ jsx26(Icon2, {}) }) }, o)) })
-  ] });
+  return /* @__PURE__ */ jsx27(ToggleGroup3, { type: "single", "aria-label": "text-align", value: declared ?? "", onValueChange: (v) => onPick(v || null), children: Object.entries(ALIGN_ICONS).map(([o, Icon2]) => /* @__PURE__ */ jsx27(Tip, { label: declared === o ? `Remove "align ${o}" from this style` : `Align ${o}${!declared && computed === o ? " (current)" : ""}`, children: /* @__PURE__ */ jsx27(ToggleGroupItem3, { value: o, "aria-label": o, "data-soft": !declared && computed === o, children: /* @__PURE__ */ jsx27(Icon2, {}) }) }, o)) });
 }
-function Choice({ label: label2, prop, decls, write, computed, options }) {
+function Choice({ prop, decls, write, computed, options }) {
   const declared = readProp(decls, prop);
-  return /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-[52px_minmax(0,1fr)] items-center gap-x-2", children: [
-    /* @__PURE__ */ jsx26("span", { className: "text-muted-foreground", children: label2 }),
-    /* @__PURE__ */ jsxs4(
-      NativeSelect,
-      {
-        "aria-label": prop,
-        value: declared ?? "",
-        className: declared ? "" : "text-muted-foreground",
-        onChange: (e) => write((d) => writeProp(d, prop, e.target.value || null)),
-        children: [
-          /* @__PURE__ */ jsx26("option", { value: "", children: computed }),
-          options.map((o) => /* @__PURE__ */ jsx26("option", { value: o, children: o }, o))
-        ]
-      }
-    )
+  return /* @__PURE__ */ jsxs4(
+    NativeSelect,
+    {
+      "aria-label": prop,
+      value: declared ?? "",
+      className: declared ? "" : "text-muted-foreground",
+      onChange: (e) => write((d) => writeProp(d, prop, e.target.value || null)),
+      children: [
+        /* @__PURE__ */ jsx27("option", { value: "", children: computed }),
+        options.map((o) => /* @__PURE__ */ jsx27("option", { value: o, children: o }, o))
+      ]
+    }
+  );
+}
+var FRIENDLY = {
+  "font-size": "Font size",
+  "font-weight": "Weight",
+  "font-family": "Font",
+  "font-style": "Style",
+  font: "Font",
+  "line-height": "Line height",
+  "letter-spacing": "Letter spacing",
+  "text-transform": "Case",
+  "text-align": "Align",
+  "text-decoration": "Underline",
+  "text-wrap": "Wrapping",
+  "white-space": "Wrapping",
+  color: "Text color",
+  background: "Background",
+  "background-color": "Background",
+  "background-image": "Background image",
+  padding: "Padding",
+  "padding-top": "Padding top",
+  "padding-right": "Padding right",
+  "padding-bottom": "Padding bottom",
+  "padding-left": "Padding left",
+  "padding-inline": "Padding sides",
+  "padding-block": "Padding top & bottom",
+  margin: "Margin",
+  "margin-top": "Margin top",
+  "margin-right": "Margin right",
+  "margin-bottom": "Margin bottom",
+  "margin-left": "Margin left",
+  "margin-inline": "Margin sides",
+  "margin-block": "Margin top & bottom",
+  gap: "Gap",
+  "row-gap": "Row gap",
+  "column-gap": "Column gap",
+  width: "Width",
+  height: "Height",
+  "max-width": "Max width",
+  "min-width": "Min width",
+  "max-height": "Max height",
+  "min-height": "Min height",
+  border: "Border",
+  "border-top": "Border top",
+  "border-bottom": "Border bottom",
+  "border-color": "Border color",
+  "border-width": "Border width",
+  "border-radius": "Corner radius",
+  "box-shadow": "Shadow",
+  opacity: "Opacity",
+  display: "Display",
+  position: "Position",
+  top: "Top",
+  right: "Right",
+  bottom: "Bottom",
+  left: "Left",
+  inset: "Inset",
+  "z-index": "Stacking",
+  overflow: "Overflow",
+  "justify-content": "Justify",
+  "align-items": "Align items",
+  "align-self": "Align self",
+  "flex-direction": "Direction",
+  "flex-wrap": "Wrap",
+  flex: "Flex",
+  "grid-template-columns": "Columns",
+  "grid-template-rows": "Rows",
+  transition: "Transition",
+  transform: "Transform",
+  cursor: "Cursor",
+  "box-sizing": "Box sizing",
+  "object-fit": "Image fit",
+  "overflow-wrap": "Word breaking",
+  "word-break": "Word breaking",
+  "pointer-events": "Clicks",
+  "aspect-ratio": "Aspect ratio",
+  outline: "Outline",
+  "outline-offset": "Outline offset"
+};
+var friendly = (prop) => prop.startsWith("--") ? prop : FRIENDLY[prop] ?? prop;
+var isColorish = (prop, value) => /color|^background$|^fill$|^stroke$/.test(prop) && typeof CSS !== "undefined" && CSS.supports("color", value);
+var isBase = (m) => !m.live.source || /^(\*|html|body|:root|:host)(?![\w-])/.test(m.part.trim());
+function AllStyles({ el, cas, target }) {
+  const states = cas.matches.filter((m) => m.state && m.live.source);
+  const screens = cas.matches.filter((m) => !m.state && !m.active && m.live.source);
+  const here = cas.matches.filter((m) => !m.state && m.active && !isBase(m));
+  const base = cas.matches.filter((m) => !states.includes(m) && !screens.includes(m) && !here.includes(m));
+  const card = (m) => /* @__PURE__ */ jsx27(StyleCard, { m, cas, isTarget: m === target }, m.live.key);
+  return /* @__PURE__ */ jsxs4("div", { className: "grid grid-cols-[minmax(0,1fr)] gap-4 p-3", children: [
+    /* @__PURE__ */ jsxs4("div", { className: "flex items-start justify-between gap-2", children: [
+      /* @__PURE__ */ jsxs4("p", { className: "text-[11px] leading-relaxed text-muted-foreground", children: [
+        "Strongest first. Where two styles set the same thing, the higher one wins; the other is marked ",
+        /* @__PURE__ */ jsx27("i", { children: "overridden" }),
+        "."
+      ] }),
+      /* @__PURE__ */ jsx27(NewRule, { el, cas })
+    ] }),
+    cas.matches.length === 0 && /* @__PURE__ */ jsx27("p", { className: "text-muted-foreground", children: "No style in the project's CSS applies to this element." }),
+    here.length > 0 && /* @__PURE__ */ jsx27(Group, { title: "On this element", hint: "Applies now, at this screen size.", children: here.map(card) }),
+    screens.length > 0 && /* @__PURE__ */ jsx27(Group, { title: "Other screen sizes", hint: "Applies at other widths only. Edit the phone layout from here.", children: screens.map(card) }),
+    states.length > 0 && /* @__PURE__ */ jsx27(Group, { title: "Hover, focus and other states", hint: "Applies while the element is hovered, focused\u2026", children: states.map(card) }),
+    base.length > 0 && /* @__PURE__ */ jsxs4(Collapsible3, { className: "grid gap-2", children: [
+      /* @__PURE__ */ jsxs4(CollapsibleTrigger3, { className: "group flex items-center gap-1 text-left", children: [
+        /* @__PURE__ */ jsx27(ChevronRight, { className: "size-3 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" }),
+        /* @__PURE__ */ jsxs4(SectionTitle, { children: [
+          "Base styles \xB7 ",
+          base.length
+        ] }),
+        /* @__PURE__ */ jsx27("span", { className: "ml-1 text-[10.5px] text-muted-foreground", children: "page-wide defaults and framework styles" })
+      ] }),
+      /* @__PURE__ */ jsx27(CollapsibleContent3, { className: "grid grid-cols-[minmax(0,1fr)] gap-2", children: base.map(card) })
+    ] })
   ] });
 }
-function RuleCard({ m, cas, isTarget }) {
+function Group({ title, hint, children }) {
+  return /* @__PURE__ */ jsxs4("section", { className: "grid grid-cols-[minmax(0,1fr)] gap-2", children: [
+    /* @__PURE__ */ jsxs4("div", { className: "grid gap-0.5", children: [
+      /* @__PURE__ */ jsx27(SectionTitle, { children: title }),
+      /* @__PURE__ */ jsx27("p", { className: "text-[10.5px] text-muted-foreground", children: hint })
+    ] }),
+    children
+  ] });
+}
+function StyleCard({ m, cas, isTarget }) {
   const key = m.live.key;
   const src = m.live.source;
   const decls = store.declsOf(key);
+  const [adding, setAdding] = useState15(false);
   const [prop, setProp] = useState15("");
   const [val, setVal] = useState15("");
   const changed = store.edits.has(key);
   const set = (fn) => store.setDecls(key, fn(store.declsOf(key)));
-  return /* @__PURE__ */ jsxs4("div", { className: cn("grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-lg border bg-card p-2.5", isTarget && "border-primary/60 ring-1 ring-primary/30", (!m.active || m.state) && "opacity-75"), children: [
+  return /* @__PURE__ */ jsxs4("div", { className: cn("grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-lg border bg-card p-2.5", isTarget && "border-primary/60 ring-1 ring-primary/30"), children: [
     /* @__PURE__ */ jsxs4("div", { className: "flex items-start gap-2", children: [
-      /* @__PURE__ */ jsx26("code", { className: "min-w-0 flex-1 font-mono text-[11.5px] break-words text-code", title: m.live.rule.selectorText, children: m.live.rule.selectorText }),
-      changed && /* @__PURE__ */ jsx26(Tip, { label: "Undo the changes to this rule", children: /* @__PURE__ */ jsx26(Button, { size: "icon-sm", variant: "ghost", "aria-label": "Revert", className: "size-5", onClick: () => store.revert(key), children: /* @__PURE__ */ jsx26(Undo2, {}) }) }),
-      src && !isTarget && !m.state && /* @__PURE__ */ jsx26(Button, { size: "sm", variant: "ghost", className: "h-5 px-1.5", onClick: () => {
+      /* @__PURE__ */ jsx27("code", { className: "min-w-0 flex-1 font-mono text-[11.5px] break-words text-code", title: m.live.rule.selectorText, children: m.live.rule.selectorText }),
+      changed && /* @__PURE__ */ jsx27(Tip, { label: "Undo the changes to this style", children: /* @__PURE__ */ jsx27(Button, { size: "icon-sm", variant: "ghost", "aria-label": "Revert", className: "size-5", onClick: () => store.revert(key), children: /* @__PURE__ */ jsx27(Undo2, {}) }) }),
+      isTarget ? /* @__PURE__ */ jsx27(Badge, { variant: "outline", children: "In Design" }) : src && !m.state && /* @__PURE__ */ jsx27(Tip, { label: "Edit this style with the Design controls", children: /* @__PURE__ */ jsx27(Button, { size: "sm", variant: "ghost", className: "h-5 px-1.5", onClick: () => {
         store.target = key;
         store.emit();
-      }, children: "Edit in Design" })
+      }, children: "Use in Design" }) })
     ] }),
-    /* @__PURE__ */ jsx26(RuleMeta, { m }),
+    /* @__PURE__ */ jsx27(RuleMeta, { m }),
     !src ? /* @__PURE__ */ jsxs4("p", { className: "text-[11px] text-muted-foreground", children: [
-      "Generated (e.g. by Tailwind), not written in a source file, so read-only: ",
-      /* @__PURE__ */ jsx26("code", { className: "font-mono break-all", children: m.live.rule.style.cssText })
+      "Made by a framework (such as Tailwind), not written in your CSS, so it can't be edited here: ",
+      /* @__PURE__ */ jsx27("code", { className: "font-mono break-all", children: m.live.rule.style.cssText })
     ] }) : /* @__PURE__ */ jsxs4("div", { className: "grid gap-1", children: [
       decls.map((d, i) => {
         const applied = cas.applied.has(`${key}#${i}`) || !!m.state || !m.active;
-        return /* @__PURE__ */ jsxs4("div", { className: "group grid grid-cols-[104px_minmax(0,1fr)_20px] items-center gap-1.5", title: applied ? void 0 : "Overridden by a stronger rule", children: [
-          /* @__PURE__ */ jsx26("span", { className: cn("truncate font-mono text-[11px] text-prop", !applied && "text-muted-foreground line-through"), children: d.prop }),
-          /* @__PURE__ */ jsx26(
-            ValueInput,
-            {
-              prop: d.prop,
-              value: d.value + (d.important ? " !important" : ""),
-              className: cn("h-6", !applied && "line-through"),
-              onChange: (v) => set((ds) => ds.map((x, j) => j === i ? parseDecl(d.prop, v) : x)),
-              onClear: () => set((ds) => ds.filter((_, j) => j !== i))
-            }
-          ),
-          /* @__PURE__ */ jsx26(
+        const swatch = isColorish(d.prop, d.value);
+        return /* @__PURE__ */ jsxs4("div", { className: cn("group grid grid-cols-[100px_minmax(0,1fr)_20px] items-center gap-1.5", !applied && "opacity-60"), children: [
+          /* @__PURE__ */ jsx27(Tip, { label: applied ? d.prop : `${d.prop}: overridden, a stronger style sets this`, children: /* @__PURE__ */ jsxs4("span", { className: "grid min-w-0 leading-tight", children: [
+            /* @__PURE__ */ jsx27("span", { className: "truncate text-[11.5px] text-foreground", children: friendly(d.prop) }),
+            !applied && /* @__PURE__ */ jsx27("span", { className: "text-[9.5px] text-warning", children: "overridden" })
+          ] }) }),
+          /* @__PURE__ */ jsxs4("div", { className: "relative min-w-0", children: [
+            swatch && /* @__PURE__ */ jsx27("span", { className: "pointer-events-none absolute top-1/2 left-1.5 size-3.5 -translate-y-1/2 rounded-sm border shadow-xs", style: { background: d.value } }),
+            /* @__PURE__ */ jsx27(
+              ValueInput,
+              {
+                prop: d.prop,
+                value: d.value + (d.important ? " !important" : ""),
+                className: cn("h-6", swatch && "pl-6"),
+                onChange: (v) => set((ds) => ds.map((x, j) => j === i ? parseDecl(d.prop, v) : x)),
+                onClear: () => set((ds) => ds.filter((_, j) => j !== i))
+              }
+            )
+          ] }),
+          /* @__PURE__ */ jsx27(
             Button,
             {
               size: "icon-sm",
@@ -10863,21 +11347,25 @@ function RuleCard({ m, cas, isTarget }) {
               "aria-label": `Remove ${d.prop}`,
               className: "size-5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
               onClick: () => set((ds) => ds.filter((_, j) => j !== i)),
-              children: /* @__PURE__ */ jsx26(X, {})
+              children: /* @__PURE__ */ jsx27(X, {})
             }
           )
         ] }, `${d.prop}-${i}`);
       }),
-      /* @__PURE__ */ jsxs4("form", { className: "grid grid-cols-[104px_minmax(0,1fr)_20px] items-center gap-1.5", onSubmit: (e) => {
+      adding ? /* @__PURE__ */ jsxs4("form", { className: "grid grid-cols-[100px_minmax(0,1fr)_20px] items-center gap-1.5", onSubmit: (e) => {
         e.preventDefault();
         if (!prop.trim() || !val.trim()) return;
         set((ds) => writeProp(ds, prop.trim(), val.trim()));
         setProp("");
         setVal("");
+        setAdding(false);
       }, children: [
-        /* @__PURE__ */ jsx26(Input, { className: "h-6", list: "domeditor-props", placeholder: "+ property", value: prop, onChange: (e) => setProp(e.target.value), "aria-label": "New property" }),
-        /* @__PURE__ */ jsx26(Input, { className: "h-6", placeholder: "value", value: val, onChange: (e) => setVal(e.target.value), "aria-label": "New value" }),
-        /* @__PURE__ */ jsx26(Button, { type: "submit", size: "icon-sm", variant: "ghost", "aria-label": "Add", className: "size-5", children: /* @__PURE__ */ jsx26(CornerDownLeft, {}) })
+        /* @__PURE__ */ jsx27(Input, { className: "h-6", list: "domeditor-props", placeholder: "property", value: prop, onChange: (e) => setProp(e.target.value), "aria-label": "New property", autoFocus: true }),
+        /* @__PURE__ */ jsx27(Input, { className: "h-6", placeholder: "value", value: val, onChange: (e) => setVal(e.target.value), "aria-label": "New value" }),
+        /* @__PURE__ */ jsx27(Button, { type: "submit", size: "icon-sm", variant: "ghost", "aria-label": "Add", className: "size-5", children: /* @__PURE__ */ jsx27(CornerDownLeft, {}) })
+      ] }) : /* @__PURE__ */ jsxs4(Button, { variant: "ghost", size: "sm", className: "justify-self-start text-muted-foreground", onClick: () => setAdding(true), children: [
+        /* @__PURE__ */ jsx27(Plus, {}),
+        " Add a style"
       ] })
     ] })
   ] });
@@ -10891,59 +11379,77 @@ function NewRule({ el, cas }) {
   const [sel, setSel] = useState15("");
   const [file, setFile] = useState15("");
   if (!open) {
-    return /* @__PURE__ */ jsxs4(Button, { size: "sm", variant: "ghost", onClick: () => {
+    return /* @__PURE__ */ jsx27(Tip, { label: "Create a new style for this element in a CSS file", children: /* @__PURE__ */ jsxs4(Button, { size: "sm", variant: "outline", onClick: () => {
       setSel(suggestSelector(el));
       const own = cas.matches.find((m) => m.live.source && !/(^|\/)(globals?|index|styles?|main|app)\.css$/.test(m.live.ref.file));
       setFile(own?.live.ref.file ?? cas.matches.find((m) => m.live.source)?.live.ref.file ?? store.files[0] ?? "");
       setOpen(true);
     }, children: [
-      /* @__PURE__ */ jsx26(Plus, {}),
-      " New rule"
-    ] });
+      /* @__PURE__ */ jsx27(Plus, {}),
+      " New style"
+    ] }) });
   }
   return /* @__PURE__ */ jsxs4("form", { className: "col-span-full grid w-full gap-1.5 rounded-lg border bg-card p-2.5", onSubmit: async (e) => {
     e.preventDefault();
     await store.createRule(file, sel);
     setOpen(false);
   }, children: [
-    /* @__PURE__ */ jsx26(Input, { value: sel, onChange: (e) => setSel(e.target.value), "aria-label": "Selector", autoFocus: true }),
-    /* @__PURE__ */ jsx26(NativeSelect, { value: file, onChange: (e) => setFile(e.target.value), "aria-label": "File", children: store.files.map((f) => /* @__PURE__ */ jsx26("option", { value: f, children: f }, f)) }),
+    /* @__PURE__ */ jsxs4("label", { className: "grid gap-1 text-[10.5px] text-muted-foreground", children: [
+      "Which elements (a CSS selector)",
+      /* @__PURE__ */ jsx27(Input, { value: sel, onChange: (e) => setSel(e.target.value), "aria-label": "Selector", autoFocus: true })
+    ] }),
+    /* @__PURE__ */ jsxs4("label", { className: "grid gap-1 text-[10.5px] text-muted-foreground", children: [
+      "In file",
+      /* @__PURE__ */ jsx27(NativeSelect, { value: file, onChange: (e) => setFile(e.target.value), "aria-label": "File", children: store.files.map((f) => /* @__PURE__ */ jsx27("option", { value: f, children: f }, f)) })
+    ] }),
     /* @__PURE__ */ jsxs4("div", { className: "flex justify-end gap-1.5", children: [
-      /* @__PURE__ */ jsx26(Button, { size: "sm", variant: "ghost", onClick: () => setOpen(false), children: "Cancel" }),
-      /* @__PURE__ */ jsx26(Button, { size: "sm", type: "submit", children: "Add rule" })
+      /* @__PURE__ */ jsx27(Button, { size: "sm", variant: "ghost", onClick: () => setOpen(false), children: "Cancel" }),
+      /* @__PURE__ */ jsx27(Button, { size: "sm", type: "submit", children: "Add style" })
     ] })
   ] });
 }
 function Footer() {
   const [saving, setSaving] = useState15(false);
-  const n = store.edits.size;
+  const n = store.pending;
   const files = [...new Set([...store.edits.keys()].map((k) => store.sources.get(k)?.file).filter(Boolean))];
+  const what = [store.edits.size ? `${store.edits.size} style${store.edits.size === 1 ? "" : "s"}` : "", store.texts.size ? `${store.texts.size} text${store.texts.size === 1 ? "" : "s"}` : ""].filter(Boolean).join(" and ");
   const msg = store.message;
   return /* @__PURE__ */ jsxs4("footer", { className: "grid shrink-0 gap-2 border-t bg-background px-3 py-2.5", children: [
-    /* @__PURE__ */ jsx26("datalist", { id: "domeditor-props", children: PROPS.map((p) => /* @__PURE__ */ jsx26("option", { value: p }, p)) }),
+    /* @__PURE__ */ jsx27("datalist", { id: "domeditor-props", children: PROPS.map((p) => /* @__PURE__ */ jsx27("option", { value: p }, p)) }),
     msg && /* @__PURE__ */ jsxs4("p", { className: cn("flex items-start gap-1.5 text-[11px]", msg.kind === "ok" ? "text-success" : "text-destructive"), children: [
-      msg.kind === "ok" ? /* @__PURE__ */ jsx26(Check, { className: "mt-px size-3.5 shrink-0" }) : /* @__PURE__ */ jsx26(CircleExclamationPoint, { className: "mt-px size-3.5 shrink-0" }),
+      msg.kind === "ok" ? /* @__PURE__ */ jsx27(Check, { className: "mt-px size-3.5 shrink-0" }) : /* @__PURE__ */ jsx27(CircleExclamationPoint, { className: "mt-px size-3.5 shrink-0" }),
       msg.text
     ] }),
     n > 0 && /* @__PURE__ */ jsxs4(Collapsible3, { children: [
       /* @__PURE__ */ jsxs4(CollapsibleTrigger3, { className: "group flex w-full items-center gap-1 text-left text-[11px] text-warning hover:underline", children: [
-        /* @__PURE__ */ jsx26(ChevronRight, { className: "size-3 transition-transform group-data-[state=open]:rotate-90" }),
-        n,
-        " rule",
-        n === 1 ? "" : "s",
-        " changed in ",
-        files.map(shortFile).join(", ")
+        /* @__PURE__ */ jsx27(ChevronRight, { className: "size-3 transition-transform group-data-[state=open]:rotate-90" }),
+        what,
+        " changed",
+        files.length ? ` in ${files.map(shortFile).join(", ")}` : ""
       ] }),
-      /* @__PURE__ */ jsx26(CollapsibleContent3, { className: "mt-1.5 grid gap-1 pl-4", children: [...store.edits.keys()].map((k) => /* @__PURE__ */ jsxs4("div", { className: "flex items-center justify-between gap-2", children: [
-        /* @__PURE__ */ jsx26("code", { className: "truncate font-mono text-[11px] text-code", children: store.sources.get(k)?.selector }),
-        /* @__PURE__ */ jsxs4(Button, { size: "sm", variant: "ghost", className: "h-5 px-1.5", onClick: () => store.revert(k), children: [
-          /* @__PURE__ */ jsx26(Undo2, { className: "size-3" }),
-          " Revert"
-        ] })
-      ] }, k)) })
+      /* @__PURE__ */ jsxs4(CollapsibleContent3, { className: "mt-1.5 grid gap-1 pl-4", children: [
+        [...store.edits.keys()].map((k) => /* @__PURE__ */ jsxs4("div", { className: "flex items-center justify-between gap-2", children: [
+          /* @__PURE__ */ jsx27("code", { className: "truncate font-mono text-[11px] text-code", children: store.sources.get(k)?.selector }),
+          /* @__PURE__ */ jsxs4(Button, { size: "sm", variant: "ghost", className: "h-5 px-1.5", onClick: () => store.revert(k), children: [
+            /* @__PURE__ */ jsx27(Undo2, { className: "size-3" }),
+            " Revert"
+          ] })
+        ] }, k)),
+        [...store.texts.values()].map((c, i) => /* @__PURE__ */ jsxs4("div", { className: "flex items-center justify-between gap-2", children: [
+          /* @__PURE__ */ jsxs4("span", { className: "truncate text-[11px]", children: [
+            "\u201C",
+            short(c.after, 34),
+            "\u201D"
+          ] }),
+          /* @__PURE__ */ jsxs4(Button, { size: "sm", variant: "ghost", className: "h-5 px-1.5", onClick: () => store.revertText(c.node), children: [
+            /* @__PURE__ */ jsx27(Undo2, { className: "size-3" }),
+            " Revert"
+          ] })
+        ] }, i))
+      ] })
     ] }),
     /* @__PURE__ */ jsxs4("div", { className: "flex justify-end gap-2", children: [
-      /* @__PURE__ */ jsx26(Button, { variant: "ghost", disabled: !n, onClick: () => store.discardAll(), children: "Discard" }),
+      /* @__PURE__ */ jsx27(Button, { variant: "ghost", disabled: !n, onClick: () => store.discardAll(), children: "Discard" }),
       /* @__PURE__ */ jsxs4(Button, { disabled: !n || saving, onClick: async () => {
         setSaving(true);
         await store.save();
@@ -10973,17 +11479,17 @@ function Overlay() {
   const s = f.sel;
   const tag = "fixed rounded px-1.5 py-0.5 font-mono text-[11px] whitespace-nowrap shadow-md";
   return /* @__PURE__ */ jsxs4("div", { className: "pointer-events-none fixed inset-0 z-[2147482999]", "aria-hidden": "true", children: [
-    f.many.map((b, i) => /* @__PURE__ */ jsx26("div", { className: "fixed outline-[1.5px] outline-code outline-dashed", style: pos(b) }, i)),
+    f.many.map((b, i) => /* @__PURE__ */ jsx27("div", { className: "fixed outline-[1.5px] outline-code outline-dashed", style: pos(b) }, i)),
     s && /* @__PURE__ */ jsxs4(Fragment3, { children: [
-      /* @__PURE__ */ jsx26("div", { className: "fixed border-solid border-box-margin", style: { ...pos(s.margin), borderWidth: s.m.map((v) => `${v}px`).join(" ") } }),
-      /* @__PURE__ */ jsx26("div", { className: "fixed border-solid border-box-padding", style: { ...pos(s.padding), borderWidth: s.p.map((v) => `${v}px`).join(" ") } }),
-      /* @__PURE__ */ jsx26("div", { className: "fixed bg-box-content", style: pos(s.content) }),
-      s.gaps.map((g, i) => /* @__PURE__ */ jsx26("div", { className: "fixed", style: { ...pos(g), background: "repeating-linear-gradient(45deg, var(--box-gap) 0 4px, transparent 4px 8px)" } }, i)),
-      /* @__PURE__ */ jsx26("div", { className: cn(tag, "bg-background text-foreground"), style: labelPos(s.border), children: s.label })
+      /* @__PURE__ */ jsx27("div", { className: "fixed border-solid border-box-margin", style: { ...pos(s.margin), borderWidth: s.m.map((v) => `${v}px`).join(" ") } }),
+      /* @__PURE__ */ jsx27("div", { className: "fixed border-solid border-box-padding", style: { ...pos(s.padding), borderWidth: s.p.map((v) => `${v}px`).join(" ") } }),
+      /* @__PURE__ */ jsx27("div", { className: "fixed bg-box-content", style: pos(s.content) }),
+      s.gaps.map((g, i) => /* @__PURE__ */ jsx27("div", { className: "fixed", style: { ...pos(g), background: "repeating-linear-gradient(45deg, var(--box-gap) 0 4px, transparent 4px 8px)" } }, i)),
+      /* @__PURE__ */ jsx27("div", { className: cn(tag, "bg-background text-foreground"), style: labelPos(s.border), children: s.label })
     ] }),
     f.hover && /* @__PURE__ */ jsxs4(Fragment3, { children: [
-      /* @__PURE__ */ jsx26("div", { className: "fixed bg-primary/10 outline-[1.5px] outline-primary outline-solid", style: pos(f.hover) }),
-      /* @__PURE__ */ jsx26("div", { className: cn(tag, "bg-primary text-primary-foreground"), style: labelPos(f.hover), children: f.hoverLabel })
+      /* @__PURE__ */ jsx27("div", { className: "fixed bg-primary/10 outline-[1.5px] outline-primary outline-solid", style: pos(f.hover) }),
+      /* @__PURE__ */ jsx27("div", { className: cn(tag, "bg-primary text-primary-foreground"), style: labelPos(f.hover), children: f.hoverLabel })
     ] })
   ] });
 }
@@ -11045,10 +11551,10 @@ function gaps(el, content) {
 
 // src/client/styles.generated.ts
 var styles_generated_default = `/*! tailwindcss v4.3.5 | MIT License | https://tailwindcss.com */
-@layer properties{@supports (((-webkit-hyphens:none)) and (not (margin-trim:block))) or ((-moz-orient:inline) and (not (color:rgb(from red r g b)))){*,:before,:after,::backdrop{--tw-translate-x:0;--tw-translate-y:0;--tw-translate-z:0;--tw-border-style:solid;--tw-leading:initial;--tw-font-weight:initial;--tw-tracking:initial;--tw-ordinal:initial;--tw-slashed-zero:initial;--tw-numeric-figure:initial;--tw-numeric-spacing:initial;--tw-numeric-fraction:initial;--tw-shadow:0 0 #0000;--tw-shadow-color:initial;--tw-shadow-alpha:100%;--tw-inset-shadow:0 0 #0000;--tw-inset-shadow-color:initial;--tw-inset-shadow-alpha:100%;--tw-ring-color:initial;--tw-ring-shadow:0 0 #0000;--tw-inset-ring-color:initial;--tw-inset-ring-shadow:0 0 #0000;--tw-ring-inset:initial;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-offset-shadow:0 0 #0000;--tw-outline-style:solid;--tw-backdrop-blur:initial;--tw-backdrop-brightness:initial;--tw-backdrop-contrast:initial;--tw-backdrop-grayscale:initial;--tw-backdrop-hue-rotate:initial;--tw-backdrop-invert:initial;--tw-backdrop-opacity:initial;--tw-backdrop-saturate:initial;--tw-backdrop-sepia:initial;--tw-animation-delay:0s;--tw-animation-direction:normal;--tw-animation-duration:initial;--tw-animation-fill-mode:none;--tw-animation-iteration-count:1;--tw-enter-blur:0;--tw-enter-opacity:1;--tw-enter-rotate:0;--tw-enter-scale:1;--tw-enter-translate-x:0;--tw-enter-translate-y:0;--tw-exit-blur:0;--tw-exit-opacity:1;--tw-exit-rotate:0;--tw-exit-scale:1;--tw-exit-translate-x:0;--tw-exit-translate-y:0}}}@layer theme{:root,:host{--font-sans:"Geist", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;--color-white:#fff;--spacing:.25rem;--text-xs:.75rem;--text-xs--line-height:calc(1 / .75);--font-weight-medium:500;--font-weight-semibold:600;--tracking-wider:.05em;--leading-snug:1.375;--leading-relaxed:1.625;--default-transition-duration:.15s;--default-transition-timing-function:cubic-bezier(.4, 0, .2, 1);--default-font-family:"Geist", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;--default-mono-font-family:"Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace}:host{all:initial}}@layer base{*,:after,:before,::backdrop{box-sizing:border-box;border:0 solid;margin:0;padding:0}::file-selector-button{box-sizing:border-box;border:0 solid;margin:0;padding:0}html,:host{-webkit-text-size-adjust:100%;tab-size:4;line-height:1.5;font-family:var(--default-font-family,-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji");font-feature-settings:var(--default-font-feature-settings,normal);font-variation-settings:var(--default-font-variation-settings,normal);-webkit-tap-highlight-color:transparent}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,samp,pre{font-family:var(--default-mono-font-family,ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);font-feature-settings:var(--default-mono-font-feature-settings,normal);font-variation-settings:var(--default-mono-font-variation-settings,normal);font-size:1em}small{font-size:80%}sub,sup{vertical-align:baseline;font-size:75%;line-height:0;position:relative}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}:-moz-focusring:where(:not(iframe)){outline:auto}progress{vertical-align:baseline}summary{display:list-item}ol,ul,menu{list-style:none}img,svg,video,canvas,audio,iframe,embed,object{vertical-align:middle;display:block}img,video{max-width:100%;height:auto}button,input,select,optgroup,textarea{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}::file-selector-button{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}:where(select:is([multiple],[size])) optgroup{font-weight:bolder}:where(select:is([multiple],[size])) optgroup option{padding-inline-start:20px}::file-selector-button{margin-inline-end:4px}::placeholder{opacity:1}@supports (not ((-webkit-appearance:-apple-pay-button))) or (contain-intrinsic-size:1px){::placeholder{color:currentColor}@supports (color:color-mix(in lab, red, red)){::placeholder{color:color-mix(in oklab, currentcolor 50%, transparent)}}}textarea{resize:vertical}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-date-and-time-value{min-height:1lh;text-align:inherit}::-webkit-datetime-edit{display:inline-flex}::-webkit-datetime-edit-fields-wrapper{padding:0}::-webkit-datetime-edit{padding-block:0}::-webkit-datetime-edit-year-field{padding-block:0}::-webkit-datetime-edit-month-field{padding-block:0}::-webkit-datetime-edit-day-field{padding-block:0}::-webkit-datetime-edit-hour-field{padding-block:0}::-webkit-datetime-edit-minute-field{padding-block:0}::-webkit-datetime-edit-second-field{padding-block:0}::-webkit-datetime-edit-millisecond-field{padding-block:0}::-webkit-datetime-edit-meridiem-field{padding-block:0}::-webkit-calendar-picker-indicator{line-height:1}:-moz-ui-invalid{box-shadow:none}button,input:where([type=button],[type=reset],[type=submit]){appearance:button}::file-selector-button{appearance:button}::-webkit-inner-spin-button{height:auto}::-webkit-outer-spin-button{height:auto}[hidden]:where(:not([hidden=until-found])){display:none!important}.domeditor{font-family:var(--font-sans);color:var(--foreground);-webkit-font-smoothing:antialiased;font-size:12px;line-height:1.4}.domeditor *{border-color:var(--border)}.domeditor ::-webkit-scrollbar{width:10px;height:10px}.domeditor ::-webkit-scrollbar-thumb{background:oklch(60% 0 0/.25) padding-box padding-box;border:3px solid #0000;border-radius:999px}.domeditor ::-webkit-scrollbar-track{background:0 0}}@layer components;@layer utilities{.pointer-events-none{pointer-events:none}.absolute{position:absolute}.fixed{position:fixed}.relative{position:relative}.sticky{position:sticky}.inset-0{inset:0}.top-0{top:0}.top-1{top:var(--spacing)}.top-1\\/2{top:50%}.top-2{top:calc(var(--spacing) * 2)}.right-2{right:calc(var(--spacing) * 2)}.right-4{right:calc(var(--spacing) * 4)}.bottom-2{bottom:calc(var(--spacing) * 2)}.bottom-4{bottom:calc(var(--spacing) * 4)}.left-1\\.5{left:calc(var(--spacing) * 1.5)}.left-2{left:calc(var(--spacing) * 2)}.z-10{z-index:10}.z-\\[2147482999\\]{z-index:2147482999}.z-\\[2147483000\\]{z-index:2147483000}.z-\\[2147483647\\]{z-index:2147483647}.col-span-full{grid-column:1/-1}.col-start-1{grid-column-start:1}.col-start-2{grid-column-start:2}.col-start-3{grid-column-start:3}.row-start-1{grid-row-start:1}.row-start-2{grid-row-start:2}.row-start-3{grid-row-start:3}.container{width:100%}@media (min-width:40rem){.container{max-width:40rem}}@media (min-width:48rem){.container{max-width:48rem}}@media (min-width:64rem){.container{max-width:64rem}}@media (min-width:80rem){.container{max-width:80rem}}@media (min-width:96rem){.container{max-width:96rem}}.m-0\\.5{margin:calc(var(--spacing) * .5)}.mt-1{margin-top:var(--spacing)}.mt-1\\.5{margin-top:calc(var(--spacing) * 1.5)}.mt-px{margin-top:1px}.ml-0\\.5{margin-left:calc(var(--spacing) * .5)}.block{display:block}.flex{display:flex}.grid{display:grid}.inline{display:inline}.inline-flex{display:inline-flex}.size-1\\.5{width:calc(var(--spacing) * 1.5);height:calc(var(--spacing) * 1.5)}.size-3{width:calc(var(--spacing) * 3);height:calc(var(--spacing) * 3)}.size-3\\.5{width:calc(var(--spacing) * 3.5);height:calc(var(--spacing) * 3.5)}.size-4{width:calc(var(--spacing) * 4);height:calc(var(--spacing) * 4)}.size-5{width:calc(var(--spacing) * 5);height:calc(var(--spacing) * 5)}.size-6{width:calc(var(--spacing) * 6);height:calc(var(--spacing) * 6)}.size-7{width:calc(var(--spacing) * 7);height:calc(var(--spacing) * 7)}.h-4\\.5{height:calc(var(--spacing) * 4.5)}.h-5{height:calc(var(--spacing) * 5)}.h-6{height:calc(var(--spacing) * 6)}.h-7{height:calc(var(--spacing) * 7)}.h-8{height:calc(var(--spacing) * 8)}.h-11{height:calc(var(--spacing) * 11)}.h-auto{height:auto}.h-full{height:100%}.min-h-0{min-height:0}.min-h-5{min-height:calc(var(--spacing) * 5)}.w-12{width:calc(var(--spacing) * 12)}.w-\\[360px\\]{width:360px}.w-\\[calc\\(100\\%-4px\\)\\]{width:calc(100% - 4px)}.w-fit{width:fit-content}.w-full{width:100%}.max-w-64{max-width:calc(var(--spacing) * 64)}.max-w-\\[calc\\(100vw-16px\\)\\]{max-width:calc(100vw - 16px)}.min-w-0{min-width:0}.min-w-4\\.5{min-width:calc(var(--spacing) * 4.5)}.min-w-7{min-width:calc(var(--spacing) * 7)}.flex-1{flex:1}.shrink-0{flex-shrink:0}.-translate-y-1\\/2{--tw-translate-y:calc(calc(1 / 2 * 100%) * -1);translate:var(--tw-translate-x) var(--tw-translate-y)}.animate-in{animation:enter var(--tw-animation-duration,var(--tw-duration,.15s))var(--tw-ease,ease)var(--tw-animation-delay,0s)var(--tw-animation-iteration-count,1)var(--tw-animation-direction,normal)var(--tw-animation-fill-mode,none)}.cursor-default{cursor:default}.cursor-ew-resize{cursor:ew-resize}.resize{resize:both}.list-disc{list-style-type:disc}.appearance-none{appearance:none}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-\\[52px_minmax\\(0\\,1fr\\)\\]{grid-template-columns:52px minmax(0,1fr)}.grid-cols-\\[56px_minmax\\(0\\,1fr\\)_56px\\]{grid-template-columns:56px minmax(0,1fr) 56px}.grid-cols-\\[104px_minmax\\(0\\,1fr\\)_20px\\]{grid-template-columns:104px minmax(0,1fr) 20px}.grid-cols-\\[minmax\\(0\\,1fr\\)\\]{grid-template-columns:minmax(0,1fr)}.grid-rows-\\[32px_auto_32px\\]{grid-template-rows:32px auto 32px}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-center{align-items:center}.items-start{align-items:flex-start}.justify-between{justify-content:space-between}.justify-center{justify-content:center}.justify-end{justify-content:flex-end}.justify-items-center{justify-items:center}.gap-0\\.5{gap:calc(var(--spacing) * .5)}.gap-1{gap:var(--spacing)}.gap-1\\.5{gap:calc(var(--spacing) * 1.5)}.gap-2{gap:calc(var(--spacing) * 2)}.gap-2\\.5{gap:calc(var(--spacing) * 2.5)}.gap-4{gap:calc(var(--spacing) * 4)}.gap-x-2{column-gap:calc(var(--spacing) * 2)}.gap-x-3{column-gap:calc(var(--spacing) * 3)}.gap-y-0\\.5{row-gap:calc(var(--spacing) * .5)}.gap-y-2{row-gap:calc(var(--spacing) * 2)}.justify-self-start{justify-self:flex-start}.truncate{text-overflow:ellipsis;white-space:nowrap;overflow:hidden}.overflow-hidden{overflow:hidden}.overflow-y-auto{overflow-y:auto}.overscroll-contain{overscroll-behavior:contain}.rounded{border-radius:.25rem}.rounded-\\[5px\\]{border-radius:5px}.rounded-full{border-radius:2147483647px}.rounded-lg{border-radius:var(--radius)}.rounded-md{border-radius:calc(var(--radius) - 2px)}.rounded-sm{border-radius:calc(var(--radius) - 4px)}.rounded-xl{border-radius:calc(var(--radius) + 4px)}.border{border-style:var(--tw-border-style);border-width:1px}.border-t{border-top-style:var(--tw-border-style);border-top-width:1px}.border-b{border-bottom-style:var(--tw-border-style);border-bottom-width:1px}.border-dashed{--tw-border-style:dashed;border-style:dashed}.border-solid{--tw-border-style:solid;border-style:solid}.border-border,.border-border\\/60{border-color:var(--border)}@supports (color:color-mix(in lab, red, red)){.border-border\\/60{border-color:color-mix(in oklab, var(--border) 60%, transparent)}}.border-box-content{border-color:var(--box-content)}.border-box-margin{border-color:var(--box-margin)}.border-box-padding{border-color:var(--box-padding)}.border-input{border-color:var(--input)}.border-primary\\/60{border-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.border-primary\\/60{border-color:color-mix(in oklab, var(--primary) 60%, transparent)}}.border-transparent{border-color:#0000}.border-warning,.border-warning\\/30{border-color:var(--warning)}@supports (color:color-mix(in lab, red, red)){.border-warning\\/30{border-color:color-mix(in oklab, var(--warning) 30%, transparent)}}.bg-background,.bg-background\\/60{background-color:var(--background)}@supports (color:color-mix(in lab, red, red)){.bg-background\\/60{background-color:color-mix(in oklab, var(--background) 60%, transparent)}}.bg-background\\/95{background-color:var(--background)}@supports (color:color-mix(in lab, red, red)){.bg-background\\/95{background-color:color-mix(in oklab, var(--background) 95%, transparent)}}.bg-border{background-color:var(--border)}.bg-box-content{background-color:var(--box-content)}.bg-box-margin{background-color:var(--box-margin)}.bg-box-padding{background-color:var(--box-padding)}.bg-card{background-color:var(--card)}.bg-foreground{background-color:var(--foreground)}.bg-input\\/30{background-color:var(--input)}@supports (color:color-mix(in lab, red, red)){.bg-input\\/30{background-color:color-mix(in oklab, var(--input) 30%, transparent)}}.bg-muted{background-color:var(--muted)}.bg-primary,.bg-primary\\/10{background-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.bg-primary\\/10{background-color:color-mix(in oklab, var(--primary) 10%, transparent)}}.bg-secondary{background-color:var(--secondary)}.bg-transparent{background-color:#0000}.bg-warning,.bg-warning\\/10{background-color:var(--warning)}@supports (color:color-mix(in lab, red, red)){.bg-warning\\/10{background-color:color-mix(in oklab, var(--warning) 10%, transparent)}}.p-0\\.5{padding:calc(var(--spacing) * .5)}.p-2{padding:calc(var(--spacing) * 2)}.p-2\\.5{padding:calc(var(--spacing) * 2.5)}.p-3{padding:calc(var(--spacing) * 3)}.p-4{padding:calc(var(--spacing) * 4)}.p-\\[3px\\]{padding:3px}.px-0{padding-inline:0}.px-1{padding-inline:var(--spacing)}.px-1\\.5{padding-inline:calc(var(--spacing) * 1.5)}.px-2{padding-inline:calc(var(--spacing) * 2)}.px-2\\.5{padding-inline:calc(var(--spacing) * 2.5)}.px-3{padding-inline:calc(var(--spacing) * 3)}.px-4{padding-inline:calc(var(--spacing) * 4)}.py-0\\.5{padding-block:calc(var(--spacing) * .5)}.py-1{padding-block:var(--spacing)}.py-2{padding-block:calc(var(--spacing) * 2)}.py-2\\.5{padding-block:calc(var(--spacing) * 2.5)}.py-3{padding-block:calc(var(--spacing) * 3)}.py-6{padding-block:calc(var(--spacing) * 6)}.py-px{padding-block:1px}.pt-2\\.5{padding-top:calc(var(--spacing) * 2.5)}.pr-7{padding-right:calc(var(--spacing) * 7)}.pb-3{padding-bottom:calc(var(--spacing) * 3)}.pl-2{padding-left:calc(var(--spacing) * 2)}.pl-4{padding-left:calc(var(--spacing) * 4)}.text-center{text-align:center}.text-left{text-align:left}.font-mono{font-family:Geist Mono,ui-monospace,SF Mono,Menlo,Consolas,monospace}.font-sans{font-family:Geist,Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.text-xs{font-size:var(--text-xs);line-height:var(--tw-leading,var(--text-xs--line-height))}.text-\\[9\\.5px\\]{font-size:9.5px}.text-\\[10\\.5px\\]{font-size:10.5px}.text-\\[10px\\]{font-size:10px}.text-\\[11\\.5px\\]{font-size:11.5px}.text-\\[11px\\]{font-size:11px}.text-\\[12\\.5px\\]{font-size:12.5px}.text-\\[13px\\]{font-size:13px}.leading-7{--tw-leading:calc(var(--spacing) * 7);line-height:calc(var(--spacing) * 7)}.leading-relaxed{--tw-leading:var(--leading-relaxed);line-height:var(--leading-relaxed)}.leading-snug{--tw-leading:var(--leading-snug);line-height:var(--leading-snug)}.font-medium{--tw-font-weight:var(--font-weight-medium);font-weight:var(--font-weight-medium)}.font-semibold{--tw-font-weight:var(--font-weight-semibold);font-weight:var(--font-weight-semibold)}.tracking-wider{--tw-tracking:var(--tracking-wider);letter-spacing:var(--tracking-wider)}.text-balance{text-wrap:balance}.text-wrap{text-wrap:wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.whitespace-nowrap{white-space:nowrap}.text-background{color:var(--background)}.text-code{color:var(--code)}.text-destructive{color:var(--destructive)}.text-foreground,.text-foreground\\/70{color:var(--foreground)}@supports (color:color-mix(in lab, red, red)){.text-foreground\\/70{color:color-mix(in oklab, var(--foreground) 70%, transparent)}}.text-muted-foreground{color:var(--muted-foreground)}.text-primary{color:var(--primary)}.text-primary-foreground{color:var(--primary-foreground)}.text-prop{color:var(--prop)}.text-secondary-foreground{color:var(--secondary-foreground)}.text-success{color:var(--success)}.text-warning{color:var(--warning)}.uppercase{text-transform:uppercase}.tabular-nums{--tw-numeric-spacing:tabular-nums;font-variant-numeric:var(--tw-ordinal, ) var(--tw-slashed-zero, ) var(--tw-numeric-figure, ) var(--tw-numeric-spacing, ) var(--tw-numeric-fraction, )}.line-through{text-decoration-line:line-through}.underline-offset-4{text-underline-offset:4px}.opacity-0{opacity:0}.opacity-50{opacity:.5}.opacity-75{opacity:.75}.opacity-85{opacity:.85}.shadow{--tw-shadow:0 1px 3px 0 var(--tw-shadow-color,#0000001a), 0 1px 2px -1px var(--tw-shadow-color,#0000001a);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px var(--tw-shadow-color,#00000040);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-lg{--tw-shadow:0 10px 15px -3px var(--tw-shadow-color,#0000001a), 0 4px 6px -4px var(--tw-shadow-color,#0000001a);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-md{--tw-shadow:0 4px 6px -1px var(--tw-shadow-color,#0000001a), 0 2px 4px -2px var(--tw-shadow-color,#0000001a);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-none{--tw-shadow:0 0 #0000;box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-xs{--tw-shadow:0 1px 2px 0 var(--tw-shadow-color,#0000000d);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.ring,.ring-1{--tw-ring-shadow:var(--tw-ring-inset, ) 0 0 0 calc(1px + var(--tw-ring-offset-width)) var(--tw-ring-color,currentcolor);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.ring-primary\\/30{--tw-ring-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.ring-primary\\/30{--tw-ring-color:color-mix(in oklab, var(--primary) 30%, transparent)}}.outline{outline-style:var(--tw-outline-style);outline-width:1px}.outline-\\[1\\.5px\\]{outline-style:var(--tw-outline-style);outline-width:1.5px}.outline-code{outline-color:var(--code)}.outline-primary{outline-color:var(--primary)}.backdrop-blur{--tw-backdrop-blur:blur(8px);-webkit-backdrop-filter:var(--tw-backdrop-blur, ) var(--tw-backdrop-brightness, ) var(--tw-backdrop-contrast, ) var(--tw-backdrop-grayscale, ) var(--tw-backdrop-hue-rotate, ) var(--tw-backdrop-invert, ) var(--tw-backdrop-opacity, ) var(--tw-backdrop-saturate, ) var(--tw-backdrop-sepia, );backdrop-filter:var(--tw-backdrop-blur, ) var(--tw-backdrop-brightness, ) var(--tw-backdrop-contrast, ) var(--tw-backdrop-grayscale, ) var(--tw-backdrop-hue-rotate, ) var(--tw-backdrop-invert, ) var(--tw-backdrop-opacity, ) var(--tw-backdrop-saturate, ) var(--tw-backdrop-sepia, )}.transition-\\[color\\,background-color\\,box-shadow\\]{transition-property:color,background-color,box-shadow;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-\\[color\\,box-shadow\\,border-color\\]{transition-property:color,box-shadow,border-color;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-\\[color\\,box-shadow\\]{transition-property:color,box-shadow;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-colors{transition-property:color,background-color,border-color,outline-color,text-decoration-color,fill,stroke,--tw-gradient-from,--tw-gradient-via,--tw-gradient-to;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-transform{transition-property:transform,translate,scale,rotate;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.fade-in-0{--tw-enter-opacity:0}.outline-dashed{--tw-outline-style:dashed;outline-style:dashed}.outline-none{--tw-outline-style:none;outline-style:none}.outline-solid{--tw-outline-style:solid;outline-style:solid}.select-none{-webkit-user-select:none;user-select:none}.zoom-in-95{--tw-enter-scale:.95}@media (hover:hover){:is(:where(.group):hover .group-hover\\:opacity-100){opacity:1}}:is(:where(.group)[data-state=open] .group-data-\\[state\\=open\\]\\:rotate-90){rotate:90deg}.placeholder\\:text-muted-foreground\\/70::placeholder{color:var(--muted-foreground)}@supports (color:color-mix(in lab, red, red)){.placeholder\\:text-muted-foreground\\/70::placeholder{color:color-mix(in oklab, var(--muted-foreground) 70%, transparent)}}.last\\:border-b-0:last-child{border-bottom-style:var(--tw-border-style);border-bottom-width:0}@media (hover:hover){.hover\\:bg-accent:hover{background-color:var(--accent)}.hover\\:bg-primary\\/90:hover{background-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.hover\\:bg-primary\\/90:hover{background-color:color-mix(in oklab, var(--primary) 90%, transparent)}}.hover\\:bg-secondary\\/80:hover{background-color:var(--secondary)}@supports (color:color-mix(in lab, red, red)){.hover\\:bg-secondary\\/80:hover{background-color:color-mix(in oklab, var(--secondary) 80%, transparent)}}.hover\\:text-accent-foreground:hover{color:var(--accent-foreground)}.hover\\:text-foreground:hover{color:var(--foreground)}.hover\\:text-primary:hover{color:var(--primary)}.hover\\:underline:hover{text-decoration-line:underline}.hover\\:opacity-100:hover{opacity:1}}.focus-visible\\:border-ring:focus-visible{border-color:var(--ring)}.focus-visible\\:opacity-100:focus-visible{opacity:1}.focus-visible\\:ring-2:focus-visible{--tw-ring-shadow:var(--tw-ring-inset, ) 0 0 0 calc(2px + var(--tw-ring-offset-width)) var(--tw-ring-color,currentcolor);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.focus-visible\\:ring-ring\\/30:focus-visible{--tw-ring-color:var(--ring)}@supports (color:color-mix(in lab, red, red)){.focus-visible\\:ring-ring\\/30:focus-visible{--tw-ring-color:color-mix(in oklab, var(--ring) 30%, transparent)}}.focus-visible\\:ring-ring\\/50:focus-visible{--tw-ring-color:var(--ring)}@supports (color:color-mix(in lab, red, red)){.focus-visible\\:ring-ring\\/50:focus-visible{--tw-ring-color:color-mix(in oklab, var(--ring) 50%, transparent)}}.disabled\\:pointer-events-none:disabled{pointer-events:none}.disabled\\:cursor-not-allowed:disabled{cursor:not-allowed}.disabled\\:opacity-50:disabled{opacity:.5}.data-\\[orientation\\=horizontal\\]\\:h-px[data-orientation=horizontal]{height:1px}.data-\\[orientation\\=horizontal\\]\\:w-full[data-orientation=horizontal]{width:100%}.data-\\[orientation\\=vertical\\]\\:h-full[data-orientation=vertical]{height:100%}.data-\\[orientation\\=vertical\\]\\:w-px[data-orientation=vertical]{width:1px}.data-\\[soft\\=true\\]\\:bg-accent[data-soft=true]{background-color:var(--accent)}.data-\\[soft\\=true\\]\\:text-foreground[data-soft=true]{color:var(--foreground)}.data-\\[state\\=active\\]\\:border-input[data-state=active]{border-color:var(--input)}.data-\\[state\\=active\\]\\:bg-background[data-state=active]{background-color:var(--background)}.data-\\[state\\=active\\]\\:text-foreground[data-state=active]{color:var(--foreground)}.data-\\[state\\=active\\]\\:shadow-sm[data-state=active]{--tw-shadow:0 1px 3px 0 var(--tw-shadow-color,#0000001a), 0 1px 2px -1px var(--tw-shadow-color,#0000001a);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.data-\\[state\\=closed\\]\\:animate-out[data-state=closed]{animation:exit var(--tw-animation-duration,var(--tw-duration,.15s))var(--tw-ease,ease)var(--tw-animation-delay,0s)var(--tw-animation-iteration-count,1)var(--tw-animation-direction,normal)var(--tw-animation-fill-mode,none)}.data-\\[state\\=closed\\]\\:fade-out-0[data-state=closed]{--tw-exit-opacity:0}.data-\\[state\\=closed\\]\\:zoom-out-95[data-state=closed]{--tw-exit-scale:.95}.data-\\[state\\=on\\]\\:bg-primary[data-state=on]{background-color:var(--primary)}.data-\\[state\\=on\\]\\:text-primary-foreground[data-state=on]{color:var(--primary-foreground)}@media not all and (min-width:520px){.max-\\[520px\\]\\:inset-x-2{inset-inline:calc(var(--spacing) * 2)}.max-\\[520px\\]\\:top-\\[45vh\\]{top:45vh}.max-\\[520px\\]\\:w-auto{width:auto}}.\\[\\&_svg\\]\\:pointer-events-none svg{pointer-events:none}.\\[\\&_svg\\]\\:size-3 svg{width:calc(var(--spacing) * 3);height:calc(var(--spacing) * 3)}.\\[\\&_svg\\]\\:size-3\\.5 svg{width:calc(var(--spacing) * 3.5);height:calc(var(--spacing) * 3.5)}.\\[\\&_svg\\]\\:shrink-0 svg{flex-shrink:0}.\\[\\&_svg\\:not\\(\\[class\\*\\=\\'size-\\'\\]\\)\\]\\:size-3\\.5 svg:not([class*=size-]){width:calc(var(--spacing) * 3.5);height:calc(var(--spacing) * 3.5)}.\\[\\&\\>option\\]\\:bg-popover>option{background-color:var(--popover)}.\\[\\&\\>option\\]\\:text-popover-foreground>option{color:var(--popover-foreground)}[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:border-white\\/25{border-color:#ffffff40}@supports (color:color-mix(in lab, red, red)){[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:border-white\\/25{border-color:color-mix(in oklab, var(--color-white) 25%, transparent)}}[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:bg-white\\/15{background-color:#ffffff26}@supports (color:color-mix(in lab, red, red)){[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:bg-white\\/15{background-color:color-mix(in oklab, var(--color-white) 15%, transparent)}}[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:text-primary-foreground{color:var(--primary-foreground)}}@property --tw-animation-delay{syntax:"*";inherits:false;initial-value:0s}@property --tw-animation-direction{syntax:"*";inherits:false;initial-value:normal}@property --tw-animation-duration{syntax:"*";inherits:false}@property --tw-animation-fill-mode{syntax:"*";inherits:false;initial-value:none}@property --tw-animation-iteration-count{syntax:"*";inherits:false;initial-value:1}@property --tw-enter-blur{syntax:"*";inherits:false;initial-value:0}@property --tw-enter-opacity{syntax:"*";inherits:false;initial-value:1}@property --tw-enter-rotate{syntax:"*";inherits:false;initial-value:0}@property --tw-enter-scale{syntax:"*";inherits:false;initial-value:1}@property --tw-enter-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-enter-translate-y{syntax:"*";inherits:false;initial-value:0}@property --tw-exit-blur{syntax:"*";inherits:false;initial-value:0}@property --tw-exit-opacity{syntax:"*";inherits:false;initial-value:1}@property --tw-exit-rotate{syntax:"*";inherits:false;initial-value:0}@property --tw-exit-scale{syntax:"*";inherits:false;initial-value:1}@property --tw-exit-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-exit-translate-y{syntax:"*";inherits:false;initial-value:0}.domeditor{--radius:.625rem;--background:oklch(100% 0 0);--foreground:oklch(21% .006 285.9);--card:oklch(98.5% 0 0);--card-foreground:oklch(21% .006 285.9);--popover:oklch(100% 0 0);--popover-foreground:oklch(21% .006 285.9);--primary:oklch(54.6% .245 262.9);--primary-foreground:oklch(98.5% 0 0);--secondary:oklch(96.7% .001 286.4);--secondary-foreground:oklch(21% .006 285.9);--muted:oklch(96.7% .001 286.4);--muted-foreground:oklch(55.2% .016 285.9);--accent:oklch(96.7% .001 286.4);--accent-foreground:oklch(21% .006 285.9);--destructive:oklch(57.7% .245 27.3);--warning:oklch(64.6% .16 55);--success:oklch(59.6% .145 163.2);--code:oklch(55% .14 75);--prop:oklch(50% .13 240);--border:oklch(92% .004 286.3);--input:oklch(92% .004 286.3);--ring:oklch(54.6% .245 262.9);--box-margin:oklch(83% .12 65/.35);--box-padding:oklch(80% .12 140/.35);--box-content:oklch(75% .09 245/.35);--box-gap:oklch(70% .18 300/.35)}.domeditor.dark{--background:oklch(17% .004 285.9);--foreground:oklch(96% 0 0);--card:oklch(20.5% .005 285.9);--card-foreground:oklch(96% 0 0);--popover:oklch(21% .006 285.9);--popover-foreground:oklch(96% 0 0);--primary:oklch(62.3% .214 259.8);--primary-foreground:oklch(98.5% 0 0);--secondary:oklch(27.4% .006 286);--secondary-foreground:oklch(96% 0 0);--muted:oklch(24.4% .006 286);--muted-foreground:oklch(68% .015 286);--accent:oklch(27.4% .006 286);--accent-foreground:oklch(96% 0 0);--destructive:oklch(70.4% .191 22.2);--warning:oklch(78% .14 65);--success:oklch(77% .15 160);--code:oklch(85% .12 85);--prop:oklch(80% .1 230);--border:oklch(100% 0 0/.09);--input:oklch(100% 0 0/.12);--ring:oklch(62.3% .214 259.8);--box-margin:oklch(78% .13 60/.3);--box-padding:oklch(78% .13 140/.3);--box-content:oklch(72% .11 245/.32);--box-gap:oklch(70% .18 300/.35)}@property --tw-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-y{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-z{syntax:"*";inherits:false;initial-value:0}@property --tw-border-style{syntax:"*";inherits:false;initial-value:solid}@property --tw-leading{syntax:"*";inherits:false}@property --tw-font-weight{syntax:"*";inherits:false}@property --tw-tracking{syntax:"*";inherits:false}@property --tw-ordinal{syntax:"*";inherits:false}@property --tw-slashed-zero{syntax:"*";inherits:false}@property --tw-numeric-figure{syntax:"*";inherits:false}@property --tw-numeric-spacing{syntax:"*";inherits:false}@property --tw-numeric-fraction{syntax:"*";inherits:false}@property --tw-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-shadow-color{syntax:"*";inherits:false}@property --tw-shadow-alpha{syntax:"<percentage>";inherits:false;initial-value:100%}@property --tw-inset-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-inset-shadow-color{syntax:"*";inherits:false}@property --tw-inset-shadow-alpha{syntax:"<percentage>";inherits:false;initial-value:100%}@property --tw-ring-color{syntax:"*";inherits:false}@property --tw-ring-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-inset-ring-color{syntax:"*";inherits:false}@property --tw-inset-ring-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-ring-inset{syntax:"*";inherits:false}@property --tw-ring-offset-width{syntax:"<length>";inherits:false;initial-value:0}@property --tw-ring-offset-color{syntax:"*";inherits:false;initial-value:#fff}@property --tw-ring-offset-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-outline-style{syntax:"*";inherits:false;initial-value:solid}@property --tw-backdrop-blur{syntax:"*";inherits:false}@property --tw-backdrop-brightness{syntax:"*";inherits:false}@property --tw-backdrop-contrast{syntax:"*";inherits:false}@property --tw-backdrop-grayscale{syntax:"*";inherits:false}@property --tw-backdrop-hue-rotate{syntax:"*";inherits:false}@property --tw-backdrop-invert{syntax:"*";inherits:false}@property --tw-backdrop-opacity{syntax:"*";inherits:false}@property --tw-backdrop-saturate{syntax:"*";inherits:false}@property --tw-backdrop-sepia{syntax:"*";inherits:false}@keyframes enter{0%{opacity:var(--tw-enter-opacity,1);transform:translate3d(var(--tw-enter-translate-x,0),var(--tw-enter-translate-y,0),0)scale3d(var(--tw-enter-scale,1),var(--tw-enter-scale,1),var(--tw-enter-scale,1))rotate(var(--tw-enter-rotate,0));filter:blur(var(--tw-enter-blur,0))}}@keyframes exit{to{opacity:var(--tw-exit-opacity,1);transform:translate3d(var(--tw-exit-translate-x,0),var(--tw-exit-translate-y,0),0)scale3d(var(--tw-exit-scale,1),var(--tw-exit-scale,1),var(--tw-exit-scale,1))rotate(var(--tw-exit-rotate,0));filter:blur(var(--tw-exit-blur,0))}}@layer properties{:host,*,::before,::after,::backdrop{--tw-animation-delay:0s;--tw-animation-direction:normal;--tw-animation-fill-mode:none;--tw-animation-iteration-count:1;--tw-enter-blur:0;--tw-enter-opacity:1;--tw-enter-rotate:0;--tw-enter-scale:1;--tw-enter-translate-x:0;--tw-enter-translate-y:0;--tw-exit-blur:0;--tw-exit-opacity:1;--tw-exit-rotate:0;--tw-exit-scale:1;--tw-exit-translate-x:0;--tw-exit-translate-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-translate-z:0;--tw-border-style:solid;--tw-shadow:0 0 #0000;--tw-shadow-alpha:100%;--tw-inset-shadow:0 0 #0000;--tw-inset-shadow-alpha:100%;--tw-ring-shadow:0 0 #0000;--tw-inset-ring-shadow:0 0 #0000;--tw-ring-offset-width:0;--tw-ring-offset-color:#fff;--tw-ring-offset-shadow:0 0 #0000;--tw-outline-style:solid}}`;
+@layer properties{@supports (((-webkit-hyphens:none)) and (not (margin-trim:block))) or ((-moz-orient:inline) and (not (color:rgb(from red r g b)))){*,:before,:after,::backdrop{--tw-translate-x:0;--tw-translate-y:0;--tw-translate-z:0;--tw-rotate-x:initial;--tw-rotate-y:initial;--tw-rotate-z:initial;--tw-skew-x:initial;--tw-skew-y:initial;--tw-border-style:solid;--tw-leading:initial;--tw-font-weight:initial;--tw-tracking:initial;--tw-ordinal:initial;--tw-slashed-zero:initial;--tw-numeric-figure:initial;--tw-numeric-spacing:initial;--tw-numeric-fraction:initial;--tw-shadow:0 0 #0000;--tw-shadow-color:initial;--tw-shadow-alpha:100%;--tw-inset-shadow:0 0 #0000;--tw-inset-shadow-color:initial;--tw-inset-shadow-alpha:100%;--tw-ring-color:initial;--tw-ring-shadow:0 0 #0000;--tw-inset-ring-color:initial;--tw-inset-ring-shadow:0 0 #0000;--tw-ring-inset:initial;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-offset-shadow:0 0 #0000;--tw-outline-style:solid;--tw-backdrop-blur:initial;--tw-backdrop-brightness:initial;--tw-backdrop-contrast:initial;--tw-backdrop-grayscale:initial;--tw-backdrop-hue-rotate:initial;--tw-backdrop-invert:initial;--tw-backdrop-opacity:initial;--tw-backdrop-saturate:initial;--tw-backdrop-sepia:initial;--tw-animation-delay:0s;--tw-animation-direction:normal;--tw-animation-duration:initial;--tw-animation-fill-mode:none;--tw-animation-iteration-count:1;--tw-enter-blur:0;--tw-enter-opacity:1;--tw-enter-rotate:0;--tw-enter-scale:1;--tw-enter-translate-x:0;--tw-enter-translate-y:0;--tw-exit-blur:0;--tw-exit-opacity:1;--tw-exit-rotate:0;--tw-exit-scale:1;--tw-exit-translate-x:0;--tw-exit-translate-y:0}}}@layer theme{:root,:host{--font-sans:"Geist", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;--color-white:#fff;--spacing:.25rem;--text-xs:.75rem;--text-xs--line-height:calc(1 / .75);--font-weight-medium:500;--font-weight-semibold:600;--tracking-wider:.05em;--leading-tight:1.25;--leading-snug:1.375;--leading-relaxed:1.625;--default-transition-duration:.15s;--default-transition-timing-function:cubic-bezier(.4, 0, .2, 1);--default-font-family:"Geist", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;--default-mono-font-family:"Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace}:host{all:initial}}@layer base{*,:after,:before,::backdrop{box-sizing:border-box;border:0 solid;margin:0;padding:0}::file-selector-button{box-sizing:border-box;border:0 solid;margin:0;padding:0}html,:host{-webkit-text-size-adjust:100%;tab-size:4;line-height:1.5;font-family:var(--default-font-family,-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji");font-feature-settings:var(--default-font-feature-settings,normal);font-variation-settings:var(--default-font-variation-settings,normal);-webkit-tap-highlight-color:transparent}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,samp,pre{font-family:var(--default-mono-font-family,ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);font-feature-settings:var(--default-mono-font-feature-settings,normal);font-variation-settings:var(--default-mono-font-variation-settings,normal);font-size:1em}small{font-size:80%}sub,sup{vertical-align:baseline;font-size:75%;line-height:0;position:relative}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}:-moz-focusring:where(:not(iframe)){outline:auto}progress{vertical-align:baseline}summary{display:list-item}ol,ul,menu{list-style:none}img,svg,video,canvas,audio,iframe,embed,object{vertical-align:middle;display:block}img,video{max-width:100%;height:auto}button,input,select,optgroup,textarea{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}::file-selector-button{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}:where(select:is([multiple],[size])) optgroup{font-weight:bolder}:where(select:is([multiple],[size])) optgroup option{padding-inline-start:20px}::file-selector-button{margin-inline-end:4px}::placeholder{opacity:1}@supports (not ((-webkit-appearance:-apple-pay-button))) or (contain-intrinsic-size:1px){::placeholder{color:currentColor}@supports (color:color-mix(in lab, red, red)){::placeholder{color:color-mix(in oklab, currentcolor 50%, transparent)}}}textarea{resize:vertical}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-date-and-time-value{min-height:1lh;text-align:inherit}::-webkit-datetime-edit{display:inline-flex}::-webkit-datetime-edit-fields-wrapper{padding:0}::-webkit-datetime-edit{padding-block:0}::-webkit-datetime-edit-year-field{padding-block:0}::-webkit-datetime-edit-month-field{padding-block:0}::-webkit-datetime-edit-day-field{padding-block:0}::-webkit-datetime-edit-hour-field{padding-block:0}::-webkit-datetime-edit-minute-field{padding-block:0}::-webkit-datetime-edit-second-field{padding-block:0}::-webkit-datetime-edit-millisecond-field{padding-block:0}::-webkit-datetime-edit-meridiem-field{padding-block:0}::-webkit-calendar-picker-indicator{line-height:1}:-moz-ui-invalid{box-shadow:none}button,input:where([type=button],[type=reset],[type=submit]){appearance:button}::file-selector-button{appearance:button}::-webkit-inner-spin-button{height:auto}::-webkit-outer-spin-button{height:auto}[hidden]:where(:not([hidden=until-found])){display:none!important}.domeditor{font-family:var(--font-sans);color:var(--foreground);-webkit-font-smoothing:antialiased;font-size:12px;line-height:1.4}.domeditor *{border-color:var(--border)}.domeditor ::-webkit-scrollbar{width:10px;height:10px}.domeditor ::-webkit-scrollbar-thumb{background:oklch(60% 0 0/.25) padding-box padding-box;border:3px solid #0000;border-radius:999px}.domeditor ::-webkit-scrollbar-track{background:0 0}}@layer components;@layer utilities{.pointer-events-none{pointer-events:none}.absolute{position:absolute}.fixed{position:fixed}.relative{position:relative}.sticky{position:sticky}.inset-0{inset:0}.top-0{top:0}.top-1{top:var(--spacing)}.top-1\\/2{top:50%}.top-2{top:calc(var(--spacing) * 2)}.right-2{right:calc(var(--spacing) * 2)}.right-4{right:calc(var(--spacing) * 4)}.bottom-2{bottom:calc(var(--spacing) * 2)}.bottom-4{bottom:calc(var(--spacing) * 4)}.left-1\\.5{left:calc(var(--spacing) * 1.5)}.left-2{left:calc(var(--spacing) * 2)}.z-10{z-index:10}.z-\\[2147482999\\]{z-index:2147482999}.z-\\[2147483000\\]{z-index:2147483000}.z-\\[2147483647\\]{z-index:2147483647}.col-span-full{grid-column:1/-1}.col-start-1{grid-column-start:1}.col-start-2{grid-column-start:2}.col-start-3{grid-column-start:3}.row-start-1{grid-row-start:1}.row-start-2{grid-row-start:2}.row-start-3{grid-row-start:3}.container{width:100%}@media (min-width:40rem){.container{max-width:40rem}}@media (min-width:48rem){.container{max-width:48rem}}@media (min-width:64rem){.container{max-width:64rem}}@media (min-width:80rem){.container{max-width:80rem}}@media (min-width:96rem){.container{max-width:96rem}}.m-0\\.5{margin:calc(var(--spacing) * .5)}.mt-1{margin-top:var(--spacing)}.mt-1\\.5{margin-top:calc(var(--spacing) * 1.5)}.mt-px{margin-top:1px}.ml-0\\.5{margin-left:calc(var(--spacing) * .5)}.ml-1{margin-left:var(--spacing)}.ml-auto{margin-left:auto}.block{display:block}.flex{display:flex}.grid{display:grid}.inline{display:inline}.inline-flex{display:inline-flex}.field-sizing-content{field-sizing:content}.size-1\\.5{width:calc(var(--spacing) * 1.5);height:calc(var(--spacing) * 1.5)}.size-3{width:calc(var(--spacing) * 3);height:calc(var(--spacing) * 3)}.size-3\\.5{width:calc(var(--spacing) * 3.5);height:calc(var(--spacing) * 3.5)}.size-4{width:calc(var(--spacing) * 4);height:calc(var(--spacing) * 4)}.size-5{width:calc(var(--spacing) * 5);height:calc(var(--spacing) * 5)}.size-6{width:calc(var(--spacing) * 6);height:calc(var(--spacing) * 6)}.size-7{width:calc(var(--spacing) * 7);height:calc(var(--spacing) * 7)}.size-full{width:100%;height:100%}.h-4{height:calc(var(--spacing) * 4)}.h-4\\.5{height:calc(var(--spacing) * 4.5)}.h-5{height:calc(var(--spacing) * 5)}.h-6{height:calc(var(--spacing) * 6)}.h-7{height:calc(var(--spacing) * 7)}.h-8{height:calc(var(--spacing) * 8)}.h-11{height:calc(var(--spacing) * 11)}.h-auto{height:auto}.h-full{height:100%}.min-h-0{min-height:0}.min-h-5{min-height:calc(var(--spacing) * 5)}.min-h-8{min-height:calc(var(--spacing) * 8)}.w-12{width:calc(var(--spacing) * 12)}.w-\\[360px\\]{width:360px}.w-\\[calc\\(100\\%-4px\\)\\]{width:calc(100% - 4px)}.w-fit{width:fit-content}.w-full{width:100%}.max-w-64{max-width:calc(var(--spacing) * 64)}.max-w-\\[calc\\(100vw-16px\\)\\]{max-width:calc(100vw - 16px)}.min-w-0{min-width:0}.min-w-4\\.5{min-width:calc(var(--spacing) * 4.5)}.min-w-7{min-width:calc(var(--spacing) * 7)}.flex-1{flex:1}.shrink-0{flex-shrink:0}.-translate-y-1\\/2{--tw-translate-y:calc(calc(1 / 2 * 100%) * -1);translate:var(--tw-translate-x) var(--tw-translate-y)}.transform{transform:var(--tw-rotate-x, ) var(--tw-rotate-y, ) var(--tw-rotate-z, ) var(--tw-skew-x, ) var(--tw-skew-y, )}.animate-in{animation:enter var(--tw-animation-duration,var(--tw-duration,.15s))var(--tw-ease,ease)var(--tw-animation-delay,0s)var(--tw-animation-iteration-count,1)var(--tw-animation-direction,normal)var(--tw-animation-fill-mode,none)}.cursor-default{cursor:default}.cursor-pointer{cursor:pointer}.resize{resize:both}.resize-none{resize:none}.list-disc{list-style-type:disc}.appearance-none{appearance:none}.grid-cols-\\[52px_minmax\\(0\\,1fr\\)\\]{grid-template-columns:52px minmax(0,1fr)}.grid-cols-\\[56px_minmax\\(0\\,1fr\\)_56px\\]{grid-template-columns:56px minmax(0,1fr) 56px}.grid-cols-\\[60px_minmax\\(0\\,1fr\\)\\]{grid-template-columns:60px minmax(0,1fr)}.grid-cols-\\[100px_minmax\\(0\\,1fr\\)_20px\\]{grid-template-columns:100px minmax(0,1fr) 20px}.grid-cols-\\[minmax\\(0\\,1fr\\)\\]{grid-template-columns:minmax(0,1fr)}.grid-rows-\\[32px_auto_32px\\]{grid-template-rows:32px auto 32px}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-center{align-items:center}.items-start{align-items:flex-start}.justify-between{justify-content:space-between}.justify-center{justify-content:center}.justify-end{justify-content:flex-end}.justify-start{justify-content:flex-start}.justify-items-center{justify-items:center}.gap-0\\.5{gap:calc(var(--spacing) * .5)}.gap-1{gap:var(--spacing)}.gap-1\\.5{gap:calc(var(--spacing) * 1.5)}.gap-2{gap:calc(var(--spacing) * 2)}.gap-3{gap:calc(var(--spacing) * 3)}.gap-4{gap:calc(var(--spacing) * 4)}.gap-x-2{column-gap:calc(var(--spacing) * 2)}.gap-y-1{row-gap:var(--spacing)}.gap-y-1\\.5{row-gap:calc(var(--spacing) * 1.5)}.justify-self-start{justify-self:flex-start}.truncate{text-overflow:ellipsis;white-space:nowrap;overflow:hidden}.overflow-hidden{overflow:hidden}.overflow-y-auto{overflow-y:auto}.overscroll-contain{overscroll-behavior:contain}.rounded{border-radius:.25rem}.rounded-\\[5px\\]{border-radius:5px}.rounded-full{border-radius:2147483647px}.rounded-lg{border-radius:var(--radius)}.rounded-md{border-radius:calc(var(--radius) - 2px)}.rounded-sm{border-radius:calc(var(--radius) - 4px)}.rounded-xl{border-radius:calc(var(--radius) + 4px)}.border{border-style:var(--tw-border-style);border-width:1px}.border-t{border-top-style:var(--tw-border-style);border-top-width:1px}.border-b{border-bottom-style:var(--tw-border-style);border-bottom-width:1px}.border-dashed{--tw-border-style:dashed;border-style:dashed}.border-solid{--tw-border-style:solid;border-style:solid}.border-border,.border-border\\/60{border-color:var(--border)}@supports (color:color-mix(in lab, red, red)){.border-border\\/60{border-color:color-mix(in oklab, var(--border) 60%, transparent)}}.border-box-content{border-color:var(--box-content)}.border-box-margin{border-color:var(--box-margin)}.border-box-padding{border-color:var(--box-padding)}.border-input{border-color:var(--input)}.border-primary,.border-primary\\/60{border-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.border-primary\\/60{border-color:color-mix(in oklab, var(--primary) 60%, transparent)}}.border-transparent{border-color:#0000}.border-warning,.border-warning\\/30{border-color:var(--warning)}@supports (color:color-mix(in lab, red, red)){.border-warning\\/30{border-color:color-mix(in oklab, var(--warning) 30%, transparent)}}.bg-background,.bg-background\\/60{background-color:var(--background)}@supports (color:color-mix(in lab, red, red)){.bg-background\\/60{background-color:color-mix(in oklab, var(--background) 60%, transparent)}}.bg-background\\/95{background-color:var(--background)}@supports (color:color-mix(in lab, red, red)){.bg-background\\/95{background-color:color-mix(in oklab, var(--background) 95%, transparent)}}.bg-border{background-color:var(--border)}.bg-box-content{background-color:var(--box-content)}.bg-box-margin{background-color:var(--box-margin)}.bg-box-padding{background-color:var(--box-padding)}.bg-card{background-color:var(--card)}.bg-foreground{background-color:var(--foreground)}.bg-input\\/30{background-color:var(--input)}@supports (color:color-mix(in lab, red, red)){.bg-input\\/30{background-color:color-mix(in oklab, var(--input) 30%, transparent)}}.bg-muted{background-color:var(--muted)}.bg-primary,.bg-primary\\/10{background-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.bg-primary\\/10{background-color:color-mix(in oklab, var(--primary) 10%, transparent)}}.bg-primary\\/15{background-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.bg-primary\\/15{background-color:color-mix(in oklab, var(--primary) 15%, transparent)}}.bg-secondary{background-color:var(--secondary)}.bg-transparent{background-color:#0000}.bg-warning,.bg-warning\\/10{background-color:var(--warning)}@supports (color:color-mix(in lab, red, red)){.bg-warning\\/10{background-color:color-mix(in oklab, var(--warning) 10%, transparent)}}.p-0\\.5{padding:calc(var(--spacing) * .5)}.p-2{padding:calc(var(--spacing) * 2)}.p-2\\.5{padding:calc(var(--spacing) * 2.5)}.p-3{padding:calc(var(--spacing) * 3)}.p-4{padding:calc(var(--spacing) * 4)}.p-\\[3px\\]{padding:3px}.px-0{padding-inline:0}.px-1{padding-inline:var(--spacing)}.px-1\\.5{padding-inline:calc(var(--spacing) * 1.5)}.px-2{padding-inline:calc(var(--spacing) * 2)}.px-2\\.5{padding-inline:calc(var(--spacing) * 2.5)}.px-3{padding-inline:calc(var(--spacing) * 3)}.px-4{padding-inline:calc(var(--spacing) * 4)}.py-0\\.5{padding-block:calc(var(--spacing) * .5)}.py-1{padding-block:var(--spacing)}.py-1\\.5{padding-block:calc(var(--spacing) * 1.5)}.py-2{padding-block:calc(var(--spacing) * 2)}.py-2\\.5{padding-block:calc(var(--spacing) * 2.5)}.py-3{padding-block:calc(var(--spacing) * 3)}.py-6{padding-block:calc(var(--spacing) * 6)}.py-px{padding-block:1px}.pt-2\\.5{padding-top:calc(var(--spacing) * 2.5)}.pr-7{padding-right:calc(var(--spacing) * 7)}.pb-3{padding-bottom:calc(var(--spacing) * 3)}.pl-2{padding-left:calc(var(--spacing) * 2)}.pl-4{padding-left:calc(var(--spacing) * 4)}.pl-6{padding-left:calc(var(--spacing) * 6)}.text-center{text-align:center}.text-left{text-align:left}.font-mono{font-family:Geist Mono,ui-monospace,SF Mono,Menlo,Consolas,monospace}.font-sans{font-family:Geist,Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.text-xs{font-size:var(--text-xs);line-height:var(--tw-leading,var(--text-xs--line-height))}.text-\\[9\\.5px\\]{font-size:9.5px}.text-\\[10\\.5px\\]{font-size:10.5px}.text-\\[10px\\]{font-size:10px}.text-\\[11\\.5px\\]{font-size:11.5px}.text-\\[11px\\]{font-size:11px}.text-\\[12\\.5px\\]{font-size:12.5px}.text-\\[13px\\]{font-size:13px}.leading-7{--tw-leading:calc(var(--spacing) * 7);line-height:calc(var(--spacing) * 7)}.leading-relaxed{--tw-leading:var(--leading-relaxed);line-height:var(--leading-relaxed)}.leading-snug{--tw-leading:var(--leading-snug);line-height:var(--leading-snug)}.leading-tight{--tw-leading:var(--leading-tight);line-height:var(--leading-tight)}.font-medium{--tw-font-weight:var(--font-weight-medium);font-weight:var(--font-weight-medium)}.font-semibold{--tw-font-weight:var(--font-weight-semibold);font-weight:var(--font-weight-semibold)}.tracking-wider{--tw-tracking:var(--tracking-wider);letter-spacing:var(--tracking-wider)}.text-balance{text-wrap:balance}.text-wrap{text-wrap:wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.whitespace-nowrap{white-space:nowrap}.text-background{color:var(--background)}.text-code{color:var(--code)}.text-destructive{color:var(--destructive)}.text-foreground,.text-foreground\\/70{color:var(--foreground)}@supports (color:color-mix(in lab, red, red)){.text-foreground\\/70{color:color-mix(in oklab, var(--foreground) 70%, transparent)}}.text-muted-foreground{color:var(--muted-foreground)}.text-primary{color:var(--primary)}.text-primary-foreground{color:var(--primary-foreground)}.text-secondary-foreground{color:var(--secondary-foreground)}.text-success{color:var(--success)}.text-warning{color:var(--warning)}.uppercase{text-transform:uppercase}.tabular-nums{--tw-numeric-spacing:tabular-nums;font-variant-numeric:var(--tw-ordinal, ) var(--tw-slashed-zero, ) var(--tw-numeric-figure, ) var(--tw-numeric-spacing, ) var(--tw-numeric-fraction, )}.underline-offset-4{text-underline-offset:4px}.accent-primary{accent-color:var(--primary)}.opacity-0{opacity:0}.opacity-50{opacity:.5}.opacity-60{opacity:.6}.opacity-85{opacity:.85}.shadow{--tw-shadow:0 1px 3px 0 var(--tw-shadow-color,#0000001a), 0 1px 2px -1px var(--tw-shadow-color,#0000001a);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px var(--tw-shadow-color,#00000040);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-lg{--tw-shadow:0 10px 15px -3px var(--tw-shadow-color,#0000001a), 0 4px 6px -4px var(--tw-shadow-color,#0000001a);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-md{--tw-shadow:0 4px 6px -1px var(--tw-shadow-color,#0000001a), 0 2px 4px -2px var(--tw-shadow-color,#0000001a);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-none{--tw-shadow:0 0 #0000;box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.shadow-xs{--tw-shadow:0 1px 2px 0 var(--tw-shadow-color,#0000000d);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.ring,.ring-1{--tw-ring-shadow:var(--tw-ring-inset, ) 0 0 0 calc(1px + var(--tw-ring-offset-width)) var(--tw-ring-color,currentcolor);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.ring-primary\\/30{--tw-ring-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.ring-primary\\/30{--tw-ring-color:color-mix(in oklab, var(--primary) 30%, transparent)}}.outline{outline-style:var(--tw-outline-style);outline-width:1px}.outline-\\[1\\.5px\\]{outline-style:var(--tw-outline-style);outline-width:1.5px}.outline-code{outline-color:var(--code)}.outline-primary{outline-color:var(--primary)}.backdrop-blur{--tw-backdrop-blur:blur(8px);-webkit-backdrop-filter:var(--tw-backdrop-blur, ) var(--tw-backdrop-brightness, ) var(--tw-backdrop-contrast, ) var(--tw-backdrop-grayscale, ) var(--tw-backdrop-hue-rotate, ) var(--tw-backdrop-invert, ) var(--tw-backdrop-opacity, ) var(--tw-backdrop-saturate, ) var(--tw-backdrop-sepia, );backdrop-filter:var(--tw-backdrop-blur, ) var(--tw-backdrop-brightness, ) var(--tw-backdrop-contrast, ) var(--tw-backdrop-grayscale, ) var(--tw-backdrop-hue-rotate, ) var(--tw-backdrop-invert, ) var(--tw-backdrop-opacity, ) var(--tw-backdrop-saturate, ) var(--tw-backdrop-sepia, )}.transition{transition-property:color,background-color,border-color,outline-color,text-decoration-color,fill,stroke,--tw-gradient-from,--tw-gradient-via,--tw-gradient-to,opacity,box-shadow,transform,translate,scale,rotate,filter,-webkit-backdrop-filter,backdrop-filter,display,content-visibility,overlay,pointer-events;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-\\[color\\,background-color\\,box-shadow\\]{transition-property:color,background-color,box-shadow;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-\\[color\\,box-shadow\\,border-color\\]{transition-property:color,box-shadow,border-color;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-\\[color\\,box-shadow\\]{transition-property:color,box-shadow;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-colors{transition-property:color,background-color,border-color,outline-color,text-decoration-color,fill,stroke,--tw-gradient-from,--tw-gradient-via,--tw-gradient-to;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.transition-transform{transition-property:transform,translate,scale,rotate;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.fade-in-0{--tw-enter-opacity:0}.outline-dashed{--tw-outline-style:dashed;outline-style:dashed}.outline-none{--tw-outline-style:none;outline-style:none}.outline-solid{--tw-outline-style:solid;outline-style:solid}.select-none{-webkit-user-select:none;user-select:none}.zoom-in-95{--tw-enter-scale:.95}@media (hover:hover){:is(:where(.group):hover .group-hover\\:opacity-100){opacity:1}}:is(:where(.group)[data-state=open] .group-data-\\[state\\=open\\]\\:rotate-90){rotate:90deg}.placeholder\\:text-muted-foreground\\/70::placeholder{color:var(--muted-foreground)}@supports (color:color-mix(in lab, red, red)){.placeholder\\:text-muted-foreground\\/70::placeholder{color:color-mix(in oklab, var(--muted-foreground) 70%, transparent)}}.last\\:border-b-0:last-child{border-bottom-style:var(--tw-border-style);border-bottom-width:0}@media (hover:hover){.hover\\:bg-accent:hover{background-color:var(--accent)}.hover\\:bg-primary\\/90:hover{background-color:var(--primary)}@supports (color:color-mix(in lab, red, red)){.hover\\:bg-primary\\/90:hover{background-color:color-mix(in oklab, var(--primary) 90%, transparent)}}.hover\\:bg-secondary\\/80:hover{background-color:var(--secondary)}@supports (color:color-mix(in lab, red, red)){.hover\\:bg-secondary\\/80:hover{background-color:color-mix(in oklab, var(--secondary) 80%, transparent)}}.hover\\:text-accent-foreground:hover{color:var(--accent-foreground)}.hover\\:text-foreground:hover{color:var(--foreground)}.hover\\:text-primary:hover{color:var(--primary)}.hover\\:underline:hover{text-decoration-line:underline}.hover\\:opacity-100:hover{opacity:1}}.focus-visible\\:border-ring:focus-visible{border-color:var(--ring)}.focus-visible\\:opacity-100:focus-visible{opacity:1}.focus-visible\\:ring-2:focus-visible{--tw-ring-shadow:var(--tw-ring-inset, ) 0 0 0 calc(2px + var(--tw-ring-offset-width)) var(--tw-ring-color,currentcolor);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.focus-visible\\:ring-ring\\/30:focus-visible{--tw-ring-color:var(--ring)}@supports (color:color-mix(in lab, red, red)){.focus-visible\\:ring-ring\\/30:focus-visible{--tw-ring-color:color-mix(in oklab, var(--ring) 30%, transparent)}}.focus-visible\\:ring-ring\\/50:focus-visible{--tw-ring-color:var(--ring)}@supports (color:color-mix(in lab, red, red)){.focus-visible\\:ring-ring\\/50:focus-visible{--tw-ring-color:color-mix(in oklab, var(--ring) 50%, transparent)}}.disabled\\:pointer-events-none:disabled{pointer-events:none}.disabled\\:cursor-not-allowed:disabled{cursor:not-allowed}.disabled\\:opacity-50:disabled{opacity:.5}.data-\\[orientation\\=horizontal\\]\\:h-px[data-orientation=horizontal]{height:1px}.data-\\[orientation\\=horizontal\\]\\:w-full[data-orientation=horizontal]{width:100%}.data-\\[orientation\\=vertical\\]\\:h-full[data-orientation=vertical]{height:100%}.data-\\[orientation\\=vertical\\]\\:w-px[data-orientation=vertical]{width:1px}.data-\\[soft\\=true\\]\\:bg-accent[data-soft=true]{background-color:var(--accent)}.data-\\[soft\\=true\\]\\:text-foreground[data-soft=true]{color:var(--foreground)}.data-\\[state\\=active\\]\\:border-input[data-state=active]{border-color:var(--input)}.data-\\[state\\=active\\]\\:bg-background[data-state=active]{background-color:var(--background)}.data-\\[state\\=active\\]\\:text-foreground[data-state=active]{color:var(--foreground)}.data-\\[state\\=active\\]\\:shadow-sm[data-state=active]{--tw-shadow:0 1px 3px 0 var(--tw-shadow-color,#0000001a), 0 1px 2px -1px var(--tw-shadow-color,#0000001a);box-shadow:var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow)}.data-\\[state\\=closed\\]\\:animate-out[data-state=closed]{animation:exit var(--tw-animation-duration,var(--tw-duration,.15s))var(--tw-ease,ease)var(--tw-animation-delay,0s)var(--tw-animation-iteration-count,1)var(--tw-animation-direction,normal)var(--tw-animation-fill-mode,none)}.data-\\[state\\=closed\\]\\:fade-out-0[data-state=closed]{--tw-exit-opacity:0}.data-\\[state\\=closed\\]\\:zoom-out-95[data-state=closed]{--tw-exit-scale:.95}.data-\\[state\\=on\\]\\:bg-primary[data-state=on]{background-color:var(--primary)}.data-\\[state\\=on\\]\\:text-primary-foreground[data-state=on]{color:var(--primary-foreground)}@media not all and (min-width:520px){.max-\\[520px\\]\\:inset-x-2{inset-inline:calc(var(--spacing) * 2)}.max-\\[520px\\]\\:top-\\[45vh\\]{top:45vh}.max-\\[520px\\]\\:w-auto{width:auto}}.\\[\\&_svg\\]\\:pointer-events-none svg{pointer-events:none}.\\[\\&_svg\\]\\:size-3 svg{width:calc(var(--spacing) * 3);height:calc(var(--spacing) * 3)}.\\[\\&_svg\\]\\:size-3\\.5 svg{width:calc(var(--spacing) * 3.5);height:calc(var(--spacing) * 3.5)}.\\[\\&_svg\\]\\:shrink-0 svg{flex-shrink:0}.\\[\\&_svg\\:not\\(\\[class\\*\\=\\'size-\\'\\]\\)\\]\\:size-3\\.5 svg:not([class*=size-]){width:calc(var(--spacing) * 3.5);height:calc(var(--spacing) * 3.5)}.\\[\\&\\>option\\]\\:bg-popover>option{background-color:var(--popover)}.\\[\\&\\>option\\]\\:text-popover-foreground>option{color:var(--popover-foreground)}[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:border-white\\/25{border-color:#ffffff40}@supports (color:color-mix(in lab, red, red)){[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:border-white\\/25{border-color:color-mix(in oklab, var(--color-white) 25%, transparent)}}[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:bg-white\\/15{background-color:#ffffff26}@supports (color:color-mix(in lab, red, red)){[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:bg-white\\/15{background-color:color-mix(in oklab, var(--color-white) 15%, transparent)}}[data-slot=button][data-variant=default] .\\[\\[data-slot\\=button\\]\\[data-variant\\=default\\]_\\&\\]\\:text-primary-foreground{color:var(--primary-foreground)}}@property --tw-animation-delay{syntax:"*";inherits:false;initial-value:0s}@property --tw-animation-direction{syntax:"*";inherits:false;initial-value:normal}@property --tw-animation-duration{syntax:"*";inherits:false}@property --tw-animation-fill-mode{syntax:"*";inherits:false;initial-value:none}@property --tw-animation-iteration-count{syntax:"*";inherits:false;initial-value:1}@property --tw-enter-blur{syntax:"*";inherits:false;initial-value:0}@property --tw-enter-opacity{syntax:"*";inherits:false;initial-value:1}@property --tw-enter-rotate{syntax:"*";inherits:false;initial-value:0}@property --tw-enter-scale{syntax:"*";inherits:false;initial-value:1}@property --tw-enter-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-enter-translate-y{syntax:"*";inherits:false;initial-value:0}@property --tw-exit-blur{syntax:"*";inherits:false;initial-value:0}@property --tw-exit-opacity{syntax:"*";inherits:false;initial-value:1}@property --tw-exit-rotate{syntax:"*";inherits:false;initial-value:0}@property --tw-exit-scale{syntax:"*";inherits:false;initial-value:1}@property --tw-exit-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-exit-translate-y{syntax:"*";inherits:false;initial-value:0}.domeditor{--radius:.625rem;--background:oklch(100% 0 0);--foreground:oklch(21% .006 285.9);--card:oklch(98.5% 0 0);--card-foreground:oklch(21% .006 285.9);--popover:oklch(100% 0 0);--popover-foreground:oklch(21% .006 285.9);--primary:oklch(54.6% .245 262.9);--primary-foreground:oklch(98.5% 0 0);--secondary:oklch(96.7% .001 286.4);--secondary-foreground:oklch(21% .006 285.9);--muted:oklch(96.7% .001 286.4);--muted-foreground:oklch(55.2% .016 285.9);--accent:oklch(96.7% .001 286.4);--accent-foreground:oklch(21% .006 285.9);--destructive:oklch(57.7% .245 27.3);--warning:oklch(64.6% .16 55);--success:oklch(59.6% .145 163.2);--code:oklch(55% .14 75);--prop:oklch(50% .13 240);--border:oklch(92% .004 286.3);--input:oklch(92% .004 286.3);--ring:oklch(54.6% .245 262.9);--box-margin:oklch(83% .12 65/.35);--box-padding:oklch(80% .12 140/.35);--box-content:oklch(75% .09 245/.35);--box-gap:oklch(70% .18 300/.35)}.domeditor.dark{--background:oklch(17% .004 285.9);--foreground:oklch(96% 0 0);--card:oklch(20.5% .005 285.9);--card-foreground:oklch(96% 0 0);--popover:oklch(21% .006 285.9);--popover-foreground:oklch(96% 0 0);--primary:oklch(62.3% .214 259.8);--primary-foreground:oklch(98.5% 0 0);--secondary:oklch(27.4% .006 286);--secondary-foreground:oklch(96% 0 0);--muted:oklch(24.4% .006 286);--muted-foreground:oklch(68% .015 286);--accent:oklch(27.4% .006 286);--accent-foreground:oklch(96% 0 0);--destructive:oklch(70.4% .191 22.2);--warning:oklch(78% .14 65);--success:oklch(77% .15 160);--code:oklch(85% .12 85);--prop:oklch(80% .1 230);--border:oklch(100% 0 0/.09);--input:oklch(100% 0 0/.12);--ring:oklch(62.3% .214 259.8);--box-margin:oklch(78% .13 60/.3);--box-padding:oklch(78% .13 140/.3);--box-content:oklch(72% .11 245/.32);--box-gap:oklch(70% .18 300/.35)}@property --tw-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-y{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-z{syntax:"*";inherits:false;initial-value:0}@property --tw-rotate-x{syntax:"*";inherits:false}@property --tw-rotate-y{syntax:"*";inherits:false}@property --tw-rotate-z{syntax:"*";inherits:false}@property --tw-skew-x{syntax:"*";inherits:false}@property --tw-skew-y{syntax:"*";inherits:false}@property --tw-border-style{syntax:"*";inherits:false;initial-value:solid}@property --tw-leading{syntax:"*";inherits:false}@property --tw-font-weight{syntax:"*";inherits:false}@property --tw-tracking{syntax:"*";inherits:false}@property --tw-ordinal{syntax:"*";inherits:false}@property --tw-slashed-zero{syntax:"*";inherits:false}@property --tw-numeric-figure{syntax:"*";inherits:false}@property --tw-numeric-spacing{syntax:"*";inherits:false}@property --tw-numeric-fraction{syntax:"*";inherits:false}@property --tw-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-shadow-color{syntax:"*";inherits:false}@property --tw-shadow-alpha{syntax:"<percentage>";inherits:false;initial-value:100%}@property --tw-inset-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-inset-shadow-color{syntax:"*";inherits:false}@property --tw-inset-shadow-alpha{syntax:"<percentage>";inherits:false;initial-value:100%}@property --tw-ring-color{syntax:"*";inherits:false}@property --tw-ring-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-inset-ring-color{syntax:"*";inherits:false}@property --tw-inset-ring-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-ring-inset{syntax:"*";inherits:false}@property --tw-ring-offset-width{syntax:"<length>";inherits:false;initial-value:0}@property --tw-ring-offset-color{syntax:"*";inherits:false;initial-value:#fff}@property --tw-ring-offset-shadow{syntax:"*";inherits:false;initial-value:0 0 #0000}@property --tw-outline-style{syntax:"*";inherits:false;initial-value:solid}@property --tw-backdrop-blur{syntax:"*";inherits:false}@property --tw-backdrop-brightness{syntax:"*";inherits:false}@property --tw-backdrop-contrast{syntax:"*";inherits:false}@property --tw-backdrop-grayscale{syntax:"*";inherits:false}@property --tw-backdrop-hue-rotate{syntax:"*";inherits:false}@property --tw-backdrop-invert{syntax:"*";inherits:false}@property --tw-backdrop-opacity{syntax:"*";inherits:false}@property --tw-backdrop-saturate{syntax:"*";inherits:false}@property --tw-backdrop-sepia{syntax:"*";inherits:false}@keyframes enter{0%{opacity:var(--tw-enter-opacity,1);transform:translate3d(var(--tw-enter-translate-x,0),var(--tw-enter-translate-y,0),0)scale3d(var(--tw-enter-scale,1),var(--tw-enter-scale,1),var(--tw-enter-scale,1))rotate(var(--tw-enter-rotate,0));filter:blur(var(--tw-enter-blur,0))}}@keyframes exit{to{opacity:var(--tw-exit-opacity,1);transform:translate3d(var(--tw-exit-translate-x,0),var(--tw-exit-translate-y,0),0)scale3d(var(--tw-exit-scale,1),var(--tw-exit-scale,1),var(--tw-exit-scale,1))rotate(var(--tw-exit-rotate,0));filter:blur(var(--tw-exit-blur,0))}}@layer properties{:host,*,::before,::after,::backdrop{--tw-animation-delay:0s;--tw-animation-direction:normal;--tw-animation-fill-mode:none;--tw-animation-iteration-count:1;--tw-enter-blur:0;--tw-enter-opacity:1;--tw-enter-rotate:0;--tw-enter-scale:1;--tw-enter-translate-x:0;--tw-enter-translate-y:0;--tw-exit-blur:0;--tw-exit-opacity:1;--tw-exit-rotate:0;--tw-exit-scale:1;--tw-exit-translate-x:0;--tw-exit-translate-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-translate-z:0;--tw-border-style:solid;--tw-shadow:0 0 #0000;--tw-shadow-alpha:100%;--tw-inset-shadow:0 0 #0000;--tw-inset-shadow-alpha:100%;--tw-ring-shadow:0 0 #0000;--tw-inset-ring-shadow:0 0 #0000;--tw-ring-offset-width:0;--tw-ring-offset-color:#fff;--tw-ring-offset-shadow:0 0 #0000;--tw-outline-style:solid}}`;
 
 // src/client/index.tsx
-import { jsx as jsx27 } from "react/jsx-runtime";
+import { jsx as jsx28 } from "react/jsx-runtime";
 var mounted = false;
 function mountDomEditor(options = {}) {
   if (mounted || typeof document === "undefined") return;
@@ -11062,16 +11568,26 @@ function mountDomEditor(options = {}) {
   const root = document.createElement("div");
   shadow.appendChild(root);
   setHost(host);
-  const theme = options.theme ?? "dark";
+  const theme = options.theme ?? "auto";
   const applyTheme = () => {
-    const dark = theme === "dark" || theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches;
+    const dark = theme === "dark" || theme === "system" && systemDark() || theme === "auto" && pageIsDark();
     root.className = `domeditor${dark ? " dark" : ""}`;
   };
   applyTheme();
-  if (theme === "system") matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+  if (theme === "system" || theme === "auto") matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => setTimeout(applyTheme, 50));
+  if (theme === "auto") {
+    let timers = [];
+    const again = () => {
+      timers.forEach(clearTimeout);
+      timers = [0, 150, 500].map((ms) => window.setTimeout(applyTheme, ms));
+    };
+    const watch = { attributes: true, attributeFilter: ["class", "style", "data-theme", "data-mode", "data-color-scheme"] };
+    new MutationObserver(again).observe(document.documentElement, watch);
+    new MutationObserver(again).observe(document.body, watch);
+  }
   document.body.appendChild(host);
   createRoot(root).render(
-    /* @__PURE__ */ jsx27(StrictMode, { children: /* @__PURE__ */ jsx27(PortalContainer.Provider, { value: root, children: /* @__PURE__ */ jsx27(TooltipProvider2, { children: /* @__PURE__ */ jsx27(Panel, {}) }) }) })
+    /* @__PURE__ */ jsx28(StrictMode, { children: /* @__PURE__ */ jsx28(PortalContainer.Provider, { value: root, children: /* @__PURE__ */ jsx28(TooltipProvider2, { children: /* @__PURE__ */ jsx28(Panel, {}) }) }) })
   );
   void store.load();
   watchStylesheets();
@@ -11100,6 +11616,19 @@ function watchStylesheets() {
     if (changed) reload();
   }).observe(document.head, { childList: true, subtree: true, characterData: true });
 }
+var systemDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+function pageIsDark() {
+  for (const el of [document.documentElement, document.body]) {
+    const said = `${el.getAttribute("data-theme") ?? ""} ${el.getAttribute("data-mode") ?? ""} ${el.getAttribute("data-color-scheme") ?? ""}`.toLowerCase();
+    if (/\bdark\b/.test(said) || el.classList.contains("dark")) return true;
+    if (/\blight\b/.test(said) || el.classList.contains("light")) return false;
+  }
+  for (const el of [document.body, document.documentElement]) {
+    const rgba = toRgba(getComputedStyle(el).backgroundColor);
+    if (rgba && rgba[3] > 0.5) return 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2] < 128;
+  }
+  return systemDark();
+}
 export {
   mountDomEditor
 };
@@ -11124,8 +11653,10 @@ lucide-react/dist/esm/icons/chevron-down.mjs:
 lucide-react/dist/esm/icons/chevron-right.mjs:
 lucide-react/dist/esm/icons/circle-exclamation-point.mjs:
 lucide-react/dist/esm/icons/corner-down-left.mjs:
+lucide-react/dist/esm/icons/database.mjs:
 lucide-react/dist/esm/icons/file-code.mjs:
 lucide-react/dist/esm/icons/link-2.mjs:
+lucide-react/dist/esm/icons/minus.mjs:
 lucide-react/dist/esm/icons/mouse-pointer-2.mjs:
 lucide-react/dist/esm/icons/panel-left.mjs:
 lucide-react/dist/esm/icons/panel-right.mjs:

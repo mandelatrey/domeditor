@@ -17,6 +17,21 @@ export type LiveRule = {
   source?: SourceRule;
 };
 
+/** Where a text is written in the project: a file and line. */
+export type Place = { file: string; line: number };
+
+/** A pending change to a text on the page (previewed by changing the text node itself). */
+export type TextChange = {
+  node: Text;
+  original: string; // the node's text before any change, spacing and all
+  before: string; // that text as the source would contain it (spacing collapsed)
+  after: string;
+  at?: Place; // chosen when the text is written in more than one place
+  choices?: Place[]; // offered after a save found it in more than one place
+};
+
+const squash = (s: string) => s.replace(/\s+/g, " ").trim();
+
 /** A style rule in a live stylesheet, before it is matched to the source. */
 type Item = { rule: CSSStyleRule; file: string | null; context: string[]; selector: string; conds: CSSRule[] };
 
@@ -74,6 +89,8 @@ class Store {
   files: string[] = [];
   sources = new Map<string, SourceRule>();
   edits = new Map<string, Decl[]>(); // rule key -> its declarations as edited (unsaved)
+  texts = new Map<Text, TextChange>(); // text changes (unsaved)
+  places = new Map<string, Place[] | "looking">(); // where each text is written, as far as looked up
   live: LiveRule[] = [];
   selected: Element | null = null;
   hovered: Element | null = null;
@@ -173,22 +190,82 @@ class Store {
     this.emit();
   }
 
+  /** How many changes are waiting to be saved. */
+  get pending() {
+    return this.edits.size + this.texts.size;
+  }
+
+  /** Change a text on the page: shown at once, written into the source on save. */
+  setText(node: Text, after: string) {
+    const c = this.texts.get(node);
+    const original = c?.original ?? node.data;
+    const before = squash(original);
+    if (squash(after) === before) {
+      node.data = original;
+      this.texts.delete(node);
+    } else {
+      // keep the spacing around the text, which belongs to the layout
+      const lead = /^\s*/.exec(original)![0], trail = /\s*$/.exec(original)![0];
+      node.data = lead + after + trail;
+      this.texts.set(node, { ...c, node, original, before, after });
+    }
+    this.message = null;
+    this.emit();
+  }
+  revertText(node: Text) {
+    const c = this.texts.get(node);
+    if (c) node.data = c.original;
+    this.texts.delete(node);
+    this.emit();
+  }
+  chooseTextPlace(node: Text, at: Place) {
+    const c = this.texts.get(node);
+    if (c) this.texts.set(node, { ...c, at, choices: undefined });
+    this.message = null;
+    this.emit();
+  }
+
+  /** Look up where texts are written (once each). */
+  async findPlaces(texts: string[]) {
+    const todo = [...new Set(texts.map(squash))].filter((t) => t && !this.places.has(t));
+    if (!todo.length) return;
+    for (const t of todo) this.places.set(t, "looking");
+    try {
+      const r = await fetch(this.endpoint, { method: "POST", headers: HEADERS, body: JSON.stringify({ find: todo }) });
+      const data = (await r.json()) as { found?: Place[][] };
+      todo.forEach((t, i) => this.places.set(t, data.found?.[i] ?? []));
+    } catch {
+      for (const t of todo) this.places.delete(t);
+    }
+    this.emit();
+  }
+
   revert(key: string) {
     const src = this.sources.get(key);
     if (src) this.setDecls(key, src.decls);
   }
   discardAll() {
     for (const key of [...this.edits.keys()]) this.revert(key);
+    for (const node of [...this.texts.keys()]) this.revertText(node);
   }
 
   async save() {
-    if (this.edits.size === 0) return;
+    if (this.pending === 0) return;
     const edits = [...this.edits].map(([key, after]) => {
       const s = this.sources.get(key)!;
       return { ref: { file: s.file, context: s.context, selector: s.selector, occurrence: s.occurrence }, before: s.decls, after };
     });
-    const r = await this.post({ edits });
-    if (!r.ok) return this.fail(r.error);
+    const changes = [...this.texts.values()];
+    const texts = changes.map((c) => ({ before: c.before, after: squash(c.after), at: c.at }));
+    const r = await this.post({ edits, texts });
+    if (!r.ok) {
+      // a text written in several places: offer them, then the next save uses the one chosen
+      const c = r.text !== undefined ? changes.find((x) => x.before === r.text) : undefined;
+      if (c && r.hits?.length) this.texts.set(c.node, { ...c, choices: r.hits });
+      return this.fail(r.error);
+    }
+    this.texts.clear();
+    this.places.clear();
     for (const [key, after] of this.edits) {
       const s = this.sources.get(key);
       if (s) this.sources.set(key, { ...s, decls: after });
@@ -197,7 +274,8 @@ class Store {
     this.message = { kind: "ok", text: `Saved to ${r.files.map(shortFile).join(", ")}` };
     this.emit();
     // Next rebuilds the CSS and swaps it in; check it did, in case the browser kept an old copy
-    for (const ms of [1500, 4000]) setTimeout(() => void refreshSavedSheets(r.files), ms);
+    const css = r.files.filter((f) => f.endsWith(".css"));
+    if (css.length) for (const ms of [1500, 4000]) setTimeout(() => void refreshSavedSheets(css), ms);
   }
 
   async createRule(file: string, selector: string) {
@@ -207,11 +285,11 @@ class Store {
     await this.load(); // the dev server swaps in the rebuilt sheet; the <head> watcher re-indexes once it lands
   }
 
-  private async post(payload: unknown): Promise<{ ok: true; files: string[] } | { ok: false; error: string }> {
+  private async post(payload: unknown): Promise<{ ok: true; files: string[] } | { ok: false; error: string; text?: string; hits?: Place[] }> {
     try {
       const r = await fetch(this.endpoint, { method: "POST", headers: HEADERS, body: JSON.stringify(payload) });
-      const data = (await r.json()) as { files?: string[]; error?: string };
-      return r.ok ? { ok: true, files: data.files ?? [] } : { ok: false, error: data.error ?? `error ${r.status}` };
+      const data = (await r.json()) as { files?: string[]; error?: string; text?: string; hits?: Place[] };
+      return r.ok ? { ok: true, files: data.files ?? [] } : { ok: false, error: data.error ?? `error ${r.status}`, text: data.text, hits: data.hits };
     } catch (e) {
       return { ok: false, error: (e as Error).message };
     }

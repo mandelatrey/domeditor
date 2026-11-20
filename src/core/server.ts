@@ -103,6 +103,68 @@ export function appendRule(css: string, selector: string, decls: Decl[]): string
   return `${css.replace(/\s*$/, "\n")}${selector.trim()} {${body}}\n`;
 }
 
+// ---------- text: copy written in the project's components
+
+/** Where a piece of text a page shows is written in a source file. */
+export type TextHit = { file: string; line: number; index: number; length: number };
+export type TextEdit = { before: string; after: string; at?: { file: string; line: number } };
+
+const TEXT_EXT = /\.(tsx|jsx|ts|js|mjs|mdx|md|html|vue|svelte|astro)$/;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// how a character the page shows may be written in source: JSX entities, escapes, line wrapping
+const SPELLINGS: Record<string, string> = {
+  "'": "(?:'|&apos;|&#39;|&rsquo;|\\\\')",
+  "’": "(?:’|&rsquo;|')",
+  '"': '(?:"|&quot;|&#34;|\\\\")',
+  "&": "(?:&|&amp;)",
+  "\u00a0": "(?:\u00a0|&nbsp;|&#160;|\\s)",
+};
+
+/** A pattern for text as the page shows it, matching the ways it is commonly written in source. */
+export function textPattern(text: string): RegExp | null {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  let src = "";
+  for (const ch of t) src += ch === " " ? "\\s+" : SPELLINGS[ch] ?? escapeRe(ch);
+  return new RegExp(src, "g");
+}
+
+/** Every place a text is written in one file's contents: as a whole "string", or as a whole run of
+ *  JSX/HTML text between tags and {expressions} (the same pieces React and the browser make text nodes of). */
+export function findTextIn(content: string, file: string, text: string): TextHit[] {
+  const re = textPattern(text);
+  if (!re) return [];
+  const prose = /\.mdx?$/.test(file);
+  const out: TextHit[] = [];
+  for (const m of content.matchAll(re)) {
+    const start = m.index!, end = start + m[0].length;
+    const q = content[start - 1];
+    const quoted = (q === '"' || q === "'" || q === "`") && content[end] === q;
+    const prev = /\S?(?=\s*$)/.exec(content.slice(Math.max(0, start - 200), start))?.[0] ?? "";
+    const next = /^\s*(\S?)/.exec(content.slice(end, end + 200))?.[1] ?? "";
+    const markup = (prev === ">" || prev === "}" || prev === "") && (next === "<" || next === "{" || next === "");
+    const word = (a: string | undefined, b: string | undefined) => !!a && !!b && /\w/.test(a) && /\w/.test(b);
+    if (!quoted && !markup && !(prose && !word(content[start - 1], m[0][0]) && !word(m[0].at(-1), content[end]))) continue;
+    out.push({ file, line: content.slice(0, start).split("\n").length, index: start, length: m[0].length });
+  }
+  return out;
+}
+
+/** Replace one hit with new text, escaped for where it sits: a "string" or JSX/markup text. */
+export function replaceText(content: string, hit: TextHit, after: string): string {
+  const q = content[hit.index - 1];
+  const inString = (q === '"' || q === "'" || q === "`") && content[hit.index + hit.length] === q;
+  let text = after.replace(/\s+/g, " ").trim();
+  if (!text) throw new EditError("the text cannot be empty: delete it in the code");
+  if (inString) {
+    text = text.replace(/\\/g, "\\\\").replaceAll(q!, `\\${q}`);
+    if (q === "`") text = text.replace(/\$\{/g, "\\${");
+  } else if (/[{}<>]/.test(text)) {
+    throw new EditError("text with { } < or > has to be changed in the code");
+  }
+  return content.slice(0, hit.index) + text + content.slice(hit.index + hit.length);
+}
+
 // ---------- the handler
 
 export type HandlerOptions = {
@@ -119,6 +181,11 @@ const SKIP = ["node_modules", ".git", ".next", ".turbo", ".vercel", ".svelte-kit
 /** Every editable stylesheet, as root-relative paths with forward slashes ("app/(admin)/admin.css"),
  *  the spelling Turbopack uses in its CSS chunks ("[project]/app/(admin)/admin.css"). */
 export function cssFiles(root: string, include: string[] = ["."], exclude: string[] = []): string[] {
+  return projectFiles(root, include, exclude, /\.css$/);
+}
+
+/** Files under the project root whose name matches, root-relative with forward slashes. */
+export function projectFiles(root: string, include: string[] = ["."], exclude: string[] = [], match: RegExp): string[] {
   const skip = new Set([...SKIP, ...exclude]);
   const seen = new Set<string>();
   const walk = (dir: string): string[] => {
@@ -131,7 +198,7 @@ export function cssFiles(root: string, include: string[] = ["."], exclude: strin
     return entries.flatMap((e) => {
       const p = join(dir, e.name);
       if (e.isDirectory()) return skip.has(e.name) || e.name.startsWith(".") ? [] : walk(p);
-      return e.name.endsWith(".css") ? [p] : [];
+      return match.test(e.name) ? [p] : [];
     });
   };
   for (const d of include) for (const f of walk(resolve(root, d))) seen.add(relative(root, f).split(sep).join("/"));
@@ -141,12 +208,25 @@ export function cssFiles(root: string, include: string[] = ["."], exclude: strin
 type SaveRequest = {
   edits?: { ref: RuleRef; before: Decl[]; after: Decl[] }[];
   create?: { file: string; selector: string; decls: Decl[] };
+  /** text changes: the text as the page showed it, the new text, and (when it is written in more than one place) which */
+  texts?: TextEdit[];
+  /** look up where texts are written, without changing anything */
+  find?: string[];
 };
+
+/** A text change that cannot be made as asked: not in the code, or in more than one place. */
+export class TextError extends EditError {
+  constructor(message: string, readonly text: string, readonly hits: TextHit[]) {
+    super(message);
+  }
+}
 
 const json = (status: number, data: unknown) =>
   new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 
 /** GET lists the rules in every stylesheet; POST writes edits. Development only. */
+const clip = (s: string) => (s.length > 40 ? `${s.slice(0, 39)}…` : s);
+
 export function createHandler(options: HandlerOptions = {}): (req: Request) => Promise<Response> {
   return async (req) => {
     if (process.env.NODE_ENV !== "development") return json(404, { error: "not found" });
@@ -167,7 +247,18 @@ export function createHandler(options: HandlerOptions = {}): (req: Request) => P
       if (req.method === "POST") {
         const text = await req.text();
         if (text.length > 1_000_000) throw new EditError("request too large");
-        const { edits = [], create } = JSON.parse(text) as SaveRequest;
+        const { edits = [], create, texts = [], find } = JSON.parse(text) as SaveRequest;
+        const sources = () => projectFiles(root, options.include, options.exclude, TEXT_EXT);
+        const lookup = (t: string, read: (f: string) => string) =>
+          sources().flatMap((f) => {
+            const c = read(f);
+            return c.length > 2_000_000 ? [] : findTextIn(c, f, t);
+          });
+        if (find) {
+          const cache = new Map<string, string>();
+          const readOnce = (f: string) => cache.get(f) ?? (cache.set(f, read(f)), cache.get(f)!);
+          return json(200, { found: find.map((t) => lookup(t, readOnce).map(({ file, line }) => ({ file, line }))) });
+        }
         const byFile = new Map<string, string>();
         const current = (f: string) => {
           if (!files.includes(f)) throw new EditError(`not an editable stylesheet: ${f}`);
@@ -175,13 +266,27 @@ export function createHandler(options: HandlerOptions = {}): (req: Request) => P
         };
         for (const e of edits) byFile.set(e.ref.file, applyRuleEdit(current(e.ref.file), e));
         if (create) byFile.set(create.file, appendRule(current(create.file), create.selector, create.decls));
+        if (texts.length) {
+          const editable = new Set(sources());
+          const now = (f: string) => byFile.get(f) ?? read(f);
+          for (const t of texts) {
+            let hits = lookup(t.before, now);
+            if (t.at) hits = hits.filter((h) => h.file === t.at!.file && h.line === t.at!.line);
+            if (hits.length === 0) throw new TextError(`"${clip(t.before)}" is not written in the code (it may come from data)`, t.before, []);
+            if (hits.length > 1) throw new TextError(`"${clip(t.before)}" is written in ${hits.length} places: choose one`, t.before, hits);
+            const hit = hits[0]!;
+            if (!editable.has(hit.file)) throw new EditError(`not an editable file: ${hit.file}`);
+            byFile.set(hit.file, replaceText(now(hit.file), hit, t.after));
+          }
+        }
         // every edit applied cleanly: only now write, so a refused edit leaves all files untouched
         for (const [f, css] of byFile) writeFileSync(join(root, f), css);
         return json(200, { ok: true, files: [...byFile.keys()] });
       }
       return json(405, { error: "method not allowed" });
     } catch (err) {
-      return json(err instanceof EditError ? 409 : 400, { error: err instanceof Error ? err.message : String(err) });
+      const text = err instanceof TextError ? { text: err.text, hits: err.hits.map(({ file, line }) => ({ file, line })) } : {};
+      return json(err instanceof EditError ? 409 : 400, { error: err instanceof Error ? err.message : String(err), ...text });
     }
   };
 }

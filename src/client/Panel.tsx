@@ -2,10 +2,14 @@
 // change into the .css file its rule came from. Rendered inside a shadow root (see index.tsx).
 import {
   AlignCenter, AlignJustify, AlignLeft, AlignRight, ArrowDown, ArrowUp, Check, ChevronRight, CircleAlert,
-  CornerDownLeft, FileCode, Link2, MousePointer2, PanelLeft, PanelRight, Plus, SquareDashedMousePointer, Undo2, X,
+  CornerDownLeft, Database, FileCode, Link2, Minus, MousePointer2, PanelLeft, PanelRight, Plus, SquareDashedMousePointer, Undo2, X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import { nudge, readProp, writeProp, writeSides, type Decl, type Side } from "../core/shared";
+import {
+  composeClamp, describeCondition, describeState, nudge, parseClamp, readProp, WEIGHT_NAMES, weightName, writeProp, writeSides,
+  type Decl, type Side,
+} from "../core/shared";
+import { toHex } from "./color";
 import {
   cascade, conditionLabel, defaultTarget, inheritedFrom, label, shortFile, store, suggestSelector, type Cascade, type Match,
 } from "./model";
@@ -17,6 +21,7 @@ import { Kbd } from "./ui/kbd";
 import { NativeSelect } from "./ui/native-select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "./ui/toggle-group";
+import { Textarea } from "./ui/textarea";
 import { Tip } from "./ui/tooltip";
 import { cn } from "./ui/utils";
 
@@ -101,7 +106,7 @@ export function Panel() {
         store.hovered = null;
         store.emit();
       }
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && store.edits.size) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && store.pending) {
         e.preventDefault();
         void store.save();
       }
@@ -128,7 +133,7 @@ export function Panel() {
       <Button variant="secondary" onClick={() => setOpen(true)}
         className="fixed right-4 bottom-4 z-[2147483000] h-8 rounded-full border px-3 shadow-lg opacity-85 hover:opacity-100">
         <SquareDashedMousePointer /> Styles
-        {store.edits.size > 0 && <span className="size-1.5 rounded-full bg-warning" />}
+        {store.pending > 0 && <span className="size-1.5 rounded-full bg-warning" />}
         <Kbd className="ml-0.5">⇧{ALT}E</Kbd>
       </Button>
     );
@@ -185,9 +190,10 @@ function Empty({ gone }: { gone: boolean }) {
         <p className="text-foreground"><b>Pick</b> an element, or <Kbd>{ALT}</Kbd> + click anything on the page.</p>
       </div>
       <ul className="grid list-disc gap-2 pl-4 leading-relaxed">
-        <li>Type a value, press <Kbd>↑</Kbd> <Kbd>↓</Kbd> on any number (<Kbd>⇧</Kbd> ×10, <Kbd>{ALT}</Kbd> ×0.1), or drag a label sideways.</li>
+        <li>Use <b className="text-foreground">−</b> and <b className="text-foreground">+</b>, type a value, or press <Kbd>↑</Kbd> <Kbd>↓</Kbd> on any number (<Kbd>⇧</Kbd> ×10, <Kbd>{ALT}</Kbd> ×0.1).</li>
         <li>Changes show at once. <b className="text-foreground">Save</b> (<Kbd>{MOD} S</Kbd>) writes them into the .css file the rule lives in.</li>
-        <li>Rules for other screen sizes are listed too: edit the phone layout from your desktop.</li>
+        <li>Change the words too: the <b className="text-foreground">Text</b> section saves new copy into the component it is written in.</li>
+        <li>Styles for other screen sizes are listed under <b className="text-foreground">All styles</b>: edit the phone layout from your desktop.</li>
       </ul>
     </div>
   );
@@ -195,7 +201,7 @@ function Empty({ gone }: { gone: boolean }) {
 
 // ---------- the inspector for one element
 
-const TEXT_PROPS = ["font-size", "line-height", "font-weight", "letter-spacing", "text-align"];
+const TEXT_PROPS = ["font-size", "line-height", "font-weight", "letter-spacing", "text-align", "color"];
 
 function Inspector({ el }: { el: Element }) {
   const version = useStore();
@@ -235,7 +241,9 @@ function Inspector({ el }: { el: Element }) {
               onClick={() => el.children[0] && store.select(el.children[0])}><ArrowDown /></Button>
           </Tip>
         </div>
-        <div className="font-mono text-[11px] text-muted-foreground">{cs.fontSize} / {lineHeightRatio(cs)} · {cs.fontWeight} · {cs.display}</div>
+        <div className="text-[11px] text-muted-foreground">
+          {px(cs.fontSize)} · {weightName(cs.fontWeight)} {cs.fontWeight} · line {lineHeightRatio(cs)}
+        </div>
         {cas.inline.length > 0 && (
           <div className="mt-1 flex gap-2 rounded-md border border-warning/30 bg-warning/10 p-2 text-[11px] text-warning">
             <CircleAlert className="mt-px size-3.5 shrink-0" />
@@ -248,57 +256,160 @@ function Inspector({ el }: { el: Element }) {
         <div className="sticky top-0 z-10 border-b bg-background/95 px-3 py-2 backdrop-blur">
           <TabsList className="w-full">
             <TabsTrigger value="design">Design</TabsTrigger>
-            <TabsTrigger value="rules">Rules <span className="text-muted-foreground tabular-nums">{cas.matches.length}</span></TabsTrigger>
+            <TabsTrigger value="rules">All styles <span className="text-muted-foreground tabular-nums">{cas.matches.length}</span></TabsTrigger>
           </TabsList>
         </div>
         <TabsContent value="design">
+          <TextSection el={el} />
           <Quick el={el} cs={cs} cas={cas} target={target} editable={editable} inherited={inherited} />
         </TabsContent>
-        <TabsContent value="rules" className="grid grid-cols-[minmax(0,1fr)] gap-2 p-3">
-          <div className="flex items-center justify-between">
-            <SectionTitle>Every rule for this element</SectionTitle>
-            <NewRule el={el} cas={cas} />
-          </div>
-          {cas.matches.length === 0 && <p className="text-muted-foreground">No rule in the project's CSS matches it.</p>}
-          {cas.matches.map((m) => <RuleCard key={m.live.key} m={m} cas={cas} isTarget={m === target} />)}
+        <TabsContent value="rules">
+          <AllStyles el={el} cas={cas} target={target} />
         </TabsContent>
       </Tabs>
     </>
   );
 }
 
-const SHORT_LABEL: Record<string, string> = {
-  "font-size": "Size", "line-height": "Line", "font-weight": "Weight", "letter-spacing": "Tracking", "max-width": "Max W", width: "Width",
-};
 const short = (s: string, n = 26) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 const px = (v: string) => `${Math.round(parseFloat(v) * 10) / 10 || 0}px`;
 function lineHeightRatio(cs: CSSStyleDeclaration) {
   const lh = parseFloat(cs.lineHeight), fs = parseFloat(cs.fontSize);
   return lh && fs ? String(Math.round((lh / fs) * 100) / 100) : cs.lineHeight;
 }
+const squash = (s: string) => s.replace(/\s+/g, " ").trim();
 
 function SectionTitle({ children, className }: { children: ReactNode; className?: string }) {
   return <h3 className={cn("text-[10px] font-semibold tracking-wider text-muted-foreground uppercase", className)}>{children}</h3>;
 }
 function Section({ title, aside, children }: { title: string; aside?: ReactNode; children: ReactNode }) {
   return (
-    <section className="grid gap-2.5 border-b px-3 py-3 last:border-b-0">
+    <section className="grid gap-3 border-b px-3 py-3 last:border-b-0">
       <div className="flex min-h-5 items-center justify-between gap-2"><SectionTitle>{title}</SectionTitle>{aside}</div>
       {children}
     </section>
   );
 }
+/** A labelled control: label on the left, control (and any note) on the right. */
+function Row({ label, title, note, children }: { label: string; title?: string; note?: ReactNode; children: ReactNode }) {
+  return (
+    <div className="grid grid-cols-[60px_minmax(0,1fr)] items-start gap-x-2">
+      <span className="truncate leading-7 text-muted-foreground" title={title}>{label}</span>
+      <div className="grid min-w-0 gap-1.5">{children}{note}</div>
+    </div>
+  );
+}
+
+// ---------- text: the words on the page, saved into the component they are written in
+
+/** The texts an element shows: its own, or (for a container) the texts inside it. */
+function textNodesOf(el: Element): Text[] {
+  const own = Array.from(el.childNodes).filter((n): n is Text => n.nodeType === Node.TEXT_NODE && wordy((n as Text).data));
+  if (own.length) return own;
+  const out: Text[] = [];
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => (wordy((n as Text).data) && !n.parentElement?.closest("script,style,noscript,svg,template") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
+  });
+  while (walker.nextNode() && out.length < 50) out.push(walker.currentNode as Text);
+  return out;
+}
+
+const MAX_TEXTS = 6;
+const ids = new WeakMap<Node, number>();
+let nextId = 0;
+const nodeId = (n: Node) => ids.get(n) ?? (ids.set(n, ++nextId), nextId);
+/** Text worth editing: has a letter or digit (not just the "." after a name). */
+const wordy = (t: string) => /[\p{L}\p{N}]/u.test(t);
+
+function TextSection({ el }: { el: Element }) {
+  useStore();
+  const nodes = useMemo(() => textNodesOf(el), [el]);
+  const shown = nodes.slice(0, MAX_TEXTS);
+  useEffect(() => {
+    void store.findPlaces(shown.map((n) => store.texts.get(n)?.original ?? n.data));
+  }, [el]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!nodes.length) return null;
+  return (
+    <Section title="Text" aside={<span className="text-[10.5px] text-muted-foreground">saved into the code</span>}>
+      {shown.map((n) => <TextRow key={nodeId(n)} node={n} label={n.parentElement !== el ? label(n.parentElement!) : undefined} />)}
+      {nodes.length > MAX_TEXTS && <p className="text-[11px] text-muted-foreground">{nodes.length - MAX_TEXTS} more inside: select the text itself to change it.</p>}
+    </Section>
+  );
+}
+
+function TextRow({ node, label: where }: { node: Text; label?: string }) {
+  const c = store.texts.get(node);
+  const original = squash(c?.original ?? node.data);
+  const current = c ? c.after : original;
+  const [draft, setDraft] = useState(current);
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setDraft(current);
+  }, [current]);
+  const places = store.places.get(original);
+  const fromData = Array.isArray(places) && places.length === 0;
+  const place = c?.at ?? (Array.isArray(places) && places.length === 1 ? places[0] : undefined);
+
+  return (
+    <div className="grid gap-1.5">
+      {where && <span className="font-mono text-[10.5px] text-muted-foreground">{short(where, 40)}</span>}
+      <Textarea
+        value={draft} disabled={fromData} aria-label="Text" rows={Math.min(5, Math.max(1, Math.ceil(draft.length / 42)))}
+        onFocus={() => { focused.current = true; }} onBlur={() => { focused.current = false; setDraft(current); }}
+        onChange={(e) => { setDraft(e.target.value); store.setText(node, e.target.value); }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") { e.stopPropagation(); store.revertText(node); (e.target as HTMLTextAreaElement).blur(); }
+        }}
+      />
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
+        {places === "looking" && <span>Looking for it in the code…</span>}
+        {fromData && (
+          <span className="inline-flex items-center gap-1"><Database className="size-3" /> Not written in the code: it comes from data, so change it where the data lives.</span>
+        )}
+        {place && (
+          <Tip label="Open in your code editor">
+            <Button variant="link" size="sm" className="h-auto gap-1 font-mono text-[10.5px]" onClick={() => openInEditor(place.file, place.line)}>
+              <FileCode className="size-3" />{shortFile(place.file)}:{place.line}
+            </Button>
+          </Tip>
+        )}
+        {!c?.at && Array.isArray(places) && places.length > 1 && !c?.choices && <span>Written in {places.length} places: you choose which when you save.</span>}
+        {c && <Button variant="ghost" size="sm" className="ml-auto h-5 px-1.5" onClick={() => store.revertText(node)}><Undo2 className="size-3" /> Undo</Button>}
+      </div>
+      {c?.choices && (
+        <div className="grid gap-1 rounded-md border border-warning/30 bg-warning/10 p-2 text-[11px]">
+          <span className="text-warning">This text is written in {c.choices.length} places. Which one is this?</span>
+          {c.choices.map((pl) => (
+            <Button key={`${pl.file}:${pl.line}`} variant="outline" size="sm" className="justify-start font-mono" onClick={() => store.chooseTextPlace(node, pl)}>
+              {shortFile(pl.file)}:{pl.line}
+            </Button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- the design controls
 
 type QuickProps = {
   el: Element; cs: CSSStyleDeclaration; cas: Cascade; target: Match | null; editable: Match[];
   inherited: Map<string, { el: Element; key: string }>;
 };
 
-/** The everyday controls: type, alignment, spacing, written to one chosen rule. */
+/** A rule as a designer reads it: "`.by-h1` · 1 element · Screens up to 640px wide". */
+function ruleLabel(m: Match) {
+  const n = countMatches(withoutStates(m.live.rule.selectorText));
+  const when = m.live.conds.length ? ` · ${describeCondition(conditionLabel(m.live))}` : "";
+  return `${m.live.rule.selectorText}  ·  ${n} element${n === 1 ? "" : "s"}${when}${m.active ? "" : " (not at this width)"}`;
+}
+
+/** The everyday controls: type, colour, spacing, layout, written to one chosen rule. */
 function Quick({ el, cs, cas, target, editable, inherited }: QuickProps) {
   const key = target?.live.key ?? null;
   const decls = key ? store.declsOf(key) : [];
   const write = (fn: (d: Decl[]) => Decl[]) => key && store.setDecls(key, fn(store.declsOf(key)));
+  const set = (prop: string) => (v: string | null) => write((d) => writeProp(d, prop, v));
   const rank = (k: string) => (k === "inline" ? -1 : cas.matches.findIndex((m) => m.live.key === k));
   // a declaration in the target will not show if a rule with higher priority sets the same longhand
   const overriddenBy = (longhand: string) => {
@@ -306,75 +417,81 @@ function Quick({ el, cs, cas, target, editable, inherited }: QuickProps) {
     if (!w || !key || w === key || rank(w) > rank(key)) return null;
     return w;
   };
-  const isBox = /flex|grid/.test(cs.display);
-
-  const field = (prop: string, placeholder: string) => (
-    <Field key={prop} label={SHORT_LABEL[prop] ?? prop} prop={prop}
-      value={readProp(decls, prop) ?? ""} placeholder={placeholder} disabled={!key}
-      onChange={(v) => write((d) => writeProp(d, prop, v))} onClear={() => write((d) => writeProp(d, prop, null))}
-      note={<Note prop={prop} over={overriddenBy(prop)} from={readProp(decls, prop) ? null : inherited.get(prop) ?? null} />} />
+  const note = (prop: string, longhand = prop) => (
+    <Note prop={prop} over={overriddenBy(longhand)} from={readProp(decls, prop) ? null : inherited.get(prop) ?? null} />
   );
+  const isBox = /flex|grid/.test(cs.display);
 
   if (!target) {
     return (
       <div className="p-3 text-muted-foreground">
-        No editable rule targets this element yet. Add one under <b className="text-foreground">Rules → New rule</b>, or select a parent.
+        No style rule in your CSS targets this element yet. Add one under <b className="text-foreground">All styles → New style</b>, or select a parent.
       </div>
     );
   }
 
   return (
     <>
-      <Section title="Rule">
+      <Section title="Changes apply to">
         <NativeSelect aria-label="Rule the controls edit" value={key!} onChange={(e) => { store.target = e.target.value; store.emit(); }}>
-          {editable.map((m) => (
-            <option key={m.live.key} value={m.live.key}>
-              {m.live.rule.selectorText}{m.live.conds.length ? `  @${conditionLabel(m.live).replace(/^@media /, "")}` : ""}{m.active ? "" : " (inactive)"}
-            </option>
-          ))}
+          {editable.map((m) => <option key={m.live.key} value={m.live.key}>{ruleLabel(m)}</option>)}
         </NativeSelect>
         <RuleMeta m={target} />
       </Section>
 
       <Section title="Typography">
-        <div className="grid grid-cols-2 items-start gap-x-3 gap-y-2">
-          {field("font-size", px(cs.fontSize))}
-          {field("line-height", lineHeightRatio(cs))}
-          {field("font-weight", cs.fontWeight)}
-          {field("letter-spacing", cs.letterSpacing === "normal" ? "0em" : cs.letterSpacing)}
-        </div>
-        <Align declared={readProp(decls, "text-align")} computed={cs.textAlign === "start" ? "left" : cs.textAlign}
-          onPick={(v) => write((d) => writeProp(d, "text-align", v))} />
+        <Row label="Size" title="font-size" note={note("font-size")}>
+          <FontSize value={readProp(decls, "font-size")} cs={cs} onChange={set("font-size")} />
+        </Row>
+        <Row label="Weight" title="font-weight" note={note("font-weight")}>
+          <Weight value={readProp(decls, "font-weight")} computed={cs.fontWeight} onChange={set("font-weight")} />
+        </Row>
+        <Row label="Line" title="line-height: the space between lines" note={note("line-height")}>
+          <Stepper prop="line-height" value={readProp(decls, "line-height") ?? ""} placeholder={lineHeightRatio(cs)} onChange={set("line-height")}
+            presets={[["Tight", "1.1"], ["Snug", "1.3"], ["Normal", "1.5"], ["Loose", "1.7"]]} />
+        </Row>
+        <Row label="Spacing" title="letter-spacing: the space between letters" note={note("letter-spacing")}>
+          <Stepper prop="letter-spacing" value={readProp(decls, "letter-spacing") ?? ""} onChange={set("letter-spacing")}
+            placeholder={cs.letterSpacing === "normal" ? "0em" : cs.letterSpacing} />
+        </Row>
+        <Row label="Color" title="color" note={note("color")}>
+          <ColorField prop="color" value={readProp(decls, "color")} computed={cs.color} onChange={set("color")} />
+        </Row>
+        <Row label="Align" title="text-align">
+          <Align declared={readProp(decls, "text-align")} computed={cs.textAlign === "start" ? "left" : cs.textAlign} onPick={set("text-align")} />
+        </Row>
       </Section>
 
       <Section title="Spacing">
         <BoxModel el={el} cs={cs} decls={decls} write={write} overriddenBy={overriddenBy} />
         {(isBox || readProp(decls, "gap")) && (
-          <div className="grid grid-cols-2 gap-x-3">
-            <Field label="Gap" prop="gap" value={readProp(decls, "gap") ?? ""} disabled={!key}
-              placeholder={cs.rowGap === cs.columnGap ? px(cs.rowGap) : `${px(cs.rowGap)} ${px(cs.columnGap)}`}
-              onChange={(v) => write((d) => writeProp(d, "gap", v))} onClear={() => write((d) => writeProp(d, "gap", null))}
-              note={<Note prop="gap" over={overriddenBy("row-gap")} from={null} />} />
-          </div>
+          <Row label="Gap" title="gap: the space between items" note={note("gap", "row-gap")}>
+            <Stepper prop="gap" value={readProp(decls, "gap") ?? ""} onChange={set("gap")}
+              placeholder={cs.rowGap === cs.columnGap ? px(cs.rowGap) : `${px(cs.rowGap)} ${px(cs.columnGap)}`} />
+          </Row>
         )}
       </Section>
 
       {isBox && (
         <Section title={`Layout · ${cs.display}`}>
-          <div className="grid grid-cols-2 gap-x-3 gap-y-2">
-            <Choice label="Justify" prop="justify-content" decls={decls} write={write} computed={cs.justifyContent}
+          <Row label="Justify" title="justify-content: along the main direction">
+            <Choice prop="justify-content" decls={decls} write={write} computed={cs.justifyContent}
               options={["normal", "flex-start", "center", "flex-end", "space-between", "space-around", "space-evenly", "stretch"]} />
-            <Choice label="Align" prop="align-items" decls={decls} write={write} computed={cs.alignItems}
+          </Row>
+          <Row label="Align" title="align-items: across the main direction">
+            <Choice prop="align-items" decls={decls} write={write} computed={cs.alignItems}
               options={["normal", "stretch", "flex-start", "center", "flex-end", "baseline"]} />
-          </div>
+          </Row>
         </Section>
       )}
 
       <Section title="Size">
-        <div className="grid grid-cols-2 gap-x-3 gap-y-2">
-          {field("max-width", cs.maxWidth)}
-          {field("width", px(cs.width))}
-        </div>
+        <Row label="Width" title="width" note={note("width")}>
+          <Stepper prop="width" value={readProp(decls, "width") ?? ""} placeholder={px(cs.width)} onChange={set("width")} />
+        </Row>
+        <Row label="Max width" title="max-width" note={note("max-width")}>
+          <Stepper prop="max-width" value={readProp(decls, "max-width") ?? ""} placeholder={cs.maxWidth} onChange={set("max-width")} />
+        </Row>
       </Section>
     </>
   );
@@ -382,22 +499,22 @@ function Quick({ el, cs, cas, target, editable, inherited }: QuickProps) {
 
 function Note({ prop, over, from }: { prop: string; over: string | null; from: { el: Element; key: string } | null }) {
   if (over) {
-    const sel = over === "inline" ? "an inline style" : store.sources.get(over)?.selector ?? "another rule";
+    const sel = over === "inline" ? "an inline style" : store.sources.get(over)?.selector ?? "another style";
     return (
-      <Tip label={`A stronger rule sets ${prop}, so edits here will not show.${over === "inline" ? "" : " Click to edit that rule instead."}`}>
-        <button type="button" className="col-start-2 justify-self-start truncate text-left text-[10.5px] text-warning hover:underline"
+      <Tip label={`A stronger style sets ${prop}, so changes here will not show.${over === "inline" ? "" : " Click to edit that one instead."}`}>
+        <button type="button" className="justify-self-start truncate text-left text-[10.5px] text-warning hover:underline"
           onClick={() => { if (over !== "inline") { store.target = over; store.emit(); } }}>
-          overridden by {short(sel, 22)}
+          overridden by {short(sel, 28)}
         </button>
       </Tip>
     );
   }
   if (from) {
     return (
-      <Tip label="Inherited. Click to select the element it comes from.">
-        <button type="button" className="col-start-2 justify-self-start truncate text-left text-[10.5px] text-muted-foreground hover:text-foreground hover:underline"
+      <Tip label="Inherited from a parent. Click to select it.">
+        <button type="button" className="justify-self-start truncate text-left text-[10.5px] text-muted-foreground hover:text-foreground hover:underline"
           onClick={() => store.select(from.el)}>
-          from {short(store.sources.get(from.key)?.selector ?? label(from.el), 22)}
+          from {short(store.sources.get(from.key)?.selector ?? label(from.el), 28)}
         </button>
       </Tip>
     );
@@ -407,29 +524,36 @@ function Note({ prop, over, from }: { prop: string; over: string | null; from: {
 
 function RuleMeta({ m }: { m: Match }) {
   const src = m.live.source;
-  const count = useMemo(() => countMatches(m.live.rule.selectorText), [m.live.rule.selectorText]);
+  const count = useMemo(() => countMatches(withoutStates(m.live.rule.selectorText)), [m.live.rule.selectorText]);
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      {src && (
-        <Tip label="Open in your code editor">
-          <Button variant="link" size="sm" className="h-5 gap-1 font-mono text-[11px]" onClick={() => openInEditor(src.file, src.line)}>
-            <FileCode className="size-3" />{shortFile(src.file)}:{src.line}
-          </Button>
-        </Tip>
-      )}
-      {m.live.conds.length > 0 && (
-        <Badge variant={m.active ? "secondary" : "warning"} className="font-mono">{conditionLabel(m.live)}{m.active ? "" : " · not at this width"}</Badge>
-      )}
-      {m.state && <Badge variant="warning" className="font-mono">{m.state}</Badge>}
-      <Tip label="Every element this rule styles on the page: hover to outline them">
+      <Tip label="Every element this style applies to: hover to outline them on the page">
         <Badge variant="outline" className="cursor-default tabular-nums"
           onMouseEnter={() => { store.highlight = m.live.key; }} onMouseLeave={() => { store.highlight = null; }}>
           {count} element{count === 1 ? "" : "s"}
         </Badge>
       </Tip>
+      {m.live.conds.length > 0 && (
+        <Tip label={conditionLabel(m.live)}>
+          <Badge variant={m.active ? "secondary" : "warning"}>{describeCondition(conditionLabel(m.live))}{m.active ? "" : " · not now"}</Badge>
+        </Tip>
+      )}
+      {m.state && <Badge variant="warning">{describeState(m.state)}</Badge>}
+      {src && (
+        <Tip label="Open in your code editor">
+          <Button variant="link" size="sm" className="h-5 gap-1 font-mono text-[10.5px] text-muted-foreground hover:text-primary" onClick={() => openInEditor(src.file, src.line)}>
+            <FileCode className="size-3" />{shortFile(src.file)}:{src.line}
+          </Button>
+        </Tip>
+      )}
     </div>
   );
 }
+
+/** ".a:hover, .b::before" -> ".a, .b": the elements a state style is for, whatever their state now. */
+const withoutStates = (selector: string) =>
+  selector.replace(/::?(hover|focus-visible|focus-within|focus|active|visited|before|after|placeholder|marker|selection|first-line|first-letter)\b/g, "")
+    .replace(/(^|,)\s*(?=,|$)/g, "$1*") || "*";
 
 function countMatches(selector: string) {
   try {
@@ -549,35 +673,124 @@ function ValueInput({ prop, value, placeholder, onChange, onClear, className, ti
   );
 }
 
-/** A labelled value whose label can be dragged sideways to scrub the number. */
-function Field({ label, prop, value, placeholder, onChange, onClear, note, disabled }: {
-  label: string; prop: string; value: string; placeholder: string; onChange: (v: string) => void; onClear: () => void;
-  note?: ReactNode; disabled?: boolean;
-}) {
-  const drag = useRef<{ x: number; base: string } | null>(null);
+// ---------- type controls
+
+const SIZE_PRESETS = [12, 14, 16, 18, 20, 24, 32, 40, 48, 64];
+
+function rootPx() {
+  return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+}
+const fmt = (n: number) => String(Math.round(n * 1000) / 1000);
+
+/** Font size: a stepper, a slider and common sizes; a responsive clamp() is edited as smallest and largest. */
+function FontSize({ value, cs, onChange }: { value: string | null; cs: CSSStyleDeclaration; onChange: (v: string | null) => void }) {
+  const now = parseFloat(cs.fontSize);
+  const clamp = value ? parseClamp(value) : null;
+  const rem = !!value && /^[\d.]+rem$/.test(value.trim());
+  const sized = (n: number) => (rem ? `${fmt(n / rootPx())}rem` : `${Math.round(n)}px`);
+  if (clamp) {
+    return (
+      <div className="grid min-w-0 gap-2 rounded-md border bg-card p-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <Badge>Responsive</Badge>
+          <span className="min-w-0 truncate text-[10.5px] text-muted-foreground" title={value!}>now {Math.round(now)}px here</span>
+          <Tip label={`Use one size everywhere (${Math.round(now)}px)`}>
+            <Button variant="link" size="sm" className="ml-auto h-auto text-[10.5px]" onClick={() => onChange(`${Math.round(now)}px`)}>Make fixed</Button>
+          </Tip>
+        </div>
+        <div className="grid grid-cols-[52px_minmax(0,1fr)] items-center gap-x-2 gap-y-1.5 text-[11px] text-muted-foreground">
+          <span>Smallest</span>
+          <Stepper prop="font-size" value={clamp[0]} onChange={(v) => v && onChange(composeClamp([v, clamp[1], clamp[2]]))} />
+          <span>Largest</span>
+          <Stepper prop="font-size" value={clamp[2]} onChange={(v) => v && onChange(composeClamp([clamp[0], clamp[1], v]))} />
+        </div>
+        <span className="text-[10.5px] text-muted-foreground">Grows with the screen in between ({clamp[1]}).</span>
+      </div>
+    );
+  }
   return (
-    <div className="grid grid-cols-[52px_minmax(0,1fr)] items-start gap-x-2 gap-y-0.5">
-      <span
-        className="cursor-ew-resize truncate leading-7 text-muted-foreground select-none hover:text-primary" style={{ touchAction: "none" }}
-        title={`${prop}: drag sideways to change (Shift ×10, Alt ×0.1)`}
-        onPointerDown={(e) => {
-          if (disabled) return;
-          e.currentTarget.setPointerCapture(e.pointerId);
-          drag.current = { x: e.clientX, base: value || placeholder };
-        }}
-        onPointerMove={(e) => {
-          const d = drag.current;
-          if (!d) return;
-          const steps = Math.round((e.clientX - d.x) / 3) * (e.shiftKey ? 10 : e.altKey ? 0.1 : 1);
-          const r = steps ? nudge(d.base, 0, steps, prop) : null;
-          if (r) onChange(r.value);
-        }}
-        onPointerUp={() => { drag.current = null; }}
-      >
-        {label}
-      </span>
-      <ValueInput prop={prop} value={value} placeholder={placeholder} onChange={onChange} onClear={onClear} disabled={disabled} />
-      {note}
+    <div className="grid gap-1.5">
+      <Stepper prop="font-size" value={value ?? ""} placeholder={px(cs.fontSize)} onChange={onChange} />
+      <input type="range" min={8} max={120} step={1} value={Math.round(now)} aria-label="Font size"
+        className="h-4 w-full cursor-pointer accent-primary" onChange={(e) => onChange(sized(Number(e.target.value)))} />
+      <div className="flex flex-wrap gap-1">
+        {SIZE_PRESETS.map((n) => (
+          <button key={n} type="button" onClick={() => onChange(sized(n))}
+            className={cn("h-5 min-w-7 rounded-sm border px-1 font-mono text-[10.5px] tabular-nums text-muted-foreground hover:bg-accent hover:text-foreground",
+              Math.round(now) === n && "border-primary bg-primary/15 text-foreground")}>
+            {n}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Font weight by name: Regular 400, Semibold 600... */
+function Weight({ value, computed, onChange }: { value: string | null; computed: string; onChange: (v: string | null) => void }) {
+  const custom = value && !WEIGHT_NAMES.some(([n]) => String(n) === value) ? value : null;
+  const n = Number(value ?? computed);
+  const step = (dir: number) => {
+    const next = dir > 0 ? (Math.floor(n / 100) + 1) * 100 : (Math.ceil(n / 100) - 1) * 100;
+    onChange(String(Math.min(900, Math.max(100, next))));
+  };
+  return (
+    <div className="flex gap-1">
+      <Button variant="outline" size="icon" aria-label="Lighter" disabled={n <= 100} onClick={() => step(-1)}><Minus /></Button>
+      <NativeSelect aria-label="font-weight" value={value ?? ""} className={value ? "font-sans" : "font-sans text-muted-foreground"}
+        onChange={(e) => onChange(e.target.value || null)}>
+        <option value="">{weightName(computed)} · {computed}{value ? " (remove)" : ""}</option>
+        {custom && <option value={custom}>{weightName(custom)} · {custom}</option>}
+        {WEIGHT_NAMES.map(([w, name]) => <option key={w} value={String(w)}>{name} · {w}</option>)}
+      </NativeSelect>
+      <Button variant="outline" size="icon" aria-label="Bolder" disabled={n >= 900} onClick={() => step(1)}><Plus /></Button>
+    </div>
+  );
+}
+
+/** − value + : the buttons and ↑/↓ change the number; presets fill in common values. */
+function Stepper({ prop, value, placeholder, onChange, presets, disabled }: {
+  prop: string; value: string; placeholder?: string; onChange: (v: string | null) => void;
+  presets?: [string, string][]; disabled?: boolean;
+}) {
+  const bump = (dir: number) => {
+    const r = nudge(value || placeholder || "0", 0, dir, prop);
+    if (r) onChange(r.value);
+  };
+  return (
+    <div className="grid gap-1">
+      <div className="flex gap-1">
+        <Button variant="outline" size="icon" aria-label={`Less ${prop}`} disabled={disabled} onClick={() => bump(-1)}><Minus /></Button>
+        <ValueInput prop={prop} value={value} placeholder={placeholder} disabled={disabled} className="text-center"
+          onChange={(v) => onChange(v)} onClear={() => onChange(null)} />
+        <Button variant="outline" size="icon" aria-label={`More ${prop}`} disabled={disabled} onClick={() => bump(1)}><Plus /></Button>
+      </div>
+      {presets && (
+        <div className="flex flex-wrap gap-1">
+          {presets.map(([name, v]) => (
+            <button key={v} type="button" onClick={() => onChange(v)} title={`${prop}: ${v}`}
+              className={cn("h-5 rounded-sm border px-1.5 text-[10.5px] text-muted-foreground hover:bg-accent hover:text-foreground",
+                (value || placeholder) === v && "border-primary bg-primary/15 text-foreground")}>
+              {name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A colour: swatch (opens the picker) and the value as written. */
+function ColorField({ prop, value, computed, onChange }: { prop: string; value: string | null; computed: string; onChange: (v: string | null) => void }) {
+  return (
+    <div className="flex gap-1">
+      <Tip label="Pick a colour">
+        <label className="relative size-7 shrink-0 cursor-pointer overflow-hidden rounded-md border shadow-xs" style={{ background: computed }}>
+          <input type="color" aria-label={`${prop} picker`} value={toHex(computed)} onChange={(e) => onChange(e.target.value)}
+            className="absolute inset-0 size-full cursor-pointer opacity-0" />
+        </label>
+      </Tip>
+      <ValueInput prop={prop} value={value ?? ""} placeholder={toHex(computed)} onChange={(v) => onChange(v)} onClear={() => onChange(null)} />
     </div>
   );
 }
@@ -586,88 +799,162 @@ const ALIGN_ICONS: Record<string, typeof AlignLeft> = { left: AlignLeft, center:
 
 function Align({ declared, computed, onPick }: { declared: string | null; computed: string; onPick: (v: string | null) => void }) {
   return (
-    <div className="grid grid-cols-[52px_minmax(0,1fr)] items-center gap-x-2">
-      <span className="text-muted-foreground">Align</span>
-      <ToggleGroup type="single" aria-label="text-align" value={declared ?? ""} onValueChange={(v) => onPick(v || null)}>
-        {Object.entries(ALIGN_ICONS).map(([o, Icon]) => (
-          <Tip key={o} label={declared === o ? `Remove text-align: ${o} from this rule` : `text-align: ${o}${!declared && computed === o ? " (current)" : ""}`}>
-            <ToggleGroupItem value={o} aria-label={o} data-soft={!declared && computed === o}><Icon /></ToggleGroupItem>
-          </Tip>
-        ))}
-      </ToggleGroup>
-    </div>
+    <ToggleGroup type="single" aria-label="text-align" value={declared ?? ""} onValueChange={(v) => onPick(v || null)}>
+      {Object.entries(ALIGN_ICONS).map(([o, Icon]) => (
+        <Tip key={o} label={declared === o ? `Remove "align ${o}" from this style` : `Align ${o}${!declared && computed === o ? " (current)" : ""}`}>
+          <ToggleGroupItem value={o} aria-label={o} data-soft={!declared && computed === o}><Icon /></ToggleGroupItem>
+        </Tip>
+      ))}
+    </ToggleGroup>
   );
 }
 
-function Choice({ label, prop, decls, write, computed, options }: {
-  label: string; prop: string; decls: Decl[]; write: (fn: (d: Decl[]) => Decl[]) => void; computed: string; options: string[];
+function Choice({ prop, decls, write, computed, options }: {
+  prop: string; decls: Decl[]; write: (fn: (d: Decl[]) => Decl[]) => void; computed: string; options: string[];
 }) {
   const declared = readProp(decls, prop);
   return (
-    <div className="grid grid-cols-[52px_minmax(0,1fr)] items-center gap-x-2">
-      <span className="text-muted-foreground">{label}</span>
-      <NativeSelect aria-label={prop} value={declared ?? ""} className={declared ? "" : "text-muted-foreground"}
-        onChange={(e) => write((d) => writeProp(d, prop, e.target.value || null))}>
-        <option value="">{computed}</option>
-        {options.map((o) => <option key={o} value={o}>{o}</option>)}
-      </NativeSelect>
+    <NativeSelect aria-label={prop} value={declared ?? ""} className={declared ? "" : "text-muted-foreground"}
+      onChange={(e) => write((d) => writeProp(d, prop, e.target.value || null))}>
+      <option value="">{computed}</option>
+      {options.map((o) => <option key={o} value={o}>{o}</option>)}
+    </NativeSelect>
+  );
+}
+
+// ---------- all styles: every rule for the element, grouped the way a designer thinks about them
+
+const FRIENDLY: Record<string, string> = {
+  "font-size": "Font size", "font-weight": "Weight", "font-family": "Font", "font-style": "Style", font: "Font", "line-height": "Line height",
+  "letter-spacing": "Letter spacing", "text-transform": "Case", "text-align": "Align", "text-decoration": "Underline", "text-wrap": "Wrapping",
+  "white-space": "Wrapping", color: "Text color", background: "Background", "background-color": "Background", "background-image": "Background image",
+  padding: "Padding", "padding-top": "Padding top", "padding-right": "Padding right", "padding-bottom": "Padding bottom", "padding-left": "Padding left",
+  "padding-inline": "Padding sides", "padding-block": "Padding top & bottom",
+  margin: "Margin", "margin-top": "Margin top", "margin-right": "Margin right", "margin-bottom": "Margin bottom", "margin-left": "Margin left",
+  "margin-inline": "Margin sides", "margin-block": "Margin top & bottom",
+  gap: "Gap", "row-gap": "Row gap", "column-gap": "Column gap", width: "Width", height: "Height", "max-width": "Max width",
+  "min-width": "Min width", "max-height": "Max height", "min-height": "Min height", border: "Border", "border-top": "Border top",
+  "border-bottom": "Border bottom", "border-color": "Border color", "border-width": "Border width", "border-radius": "Corner radius",
+  "box-shadow": "Shadow", opacity: "Opacity", display: "Display", position: "Position", top: "Top", right: "Right", bottom: "Bottom",
+  left: "Left", inset: "Inset", "z-index": "Stacking", overflow: "Overflow", "justify-content": "Justify", "align-items": "Align items",
+  "align-self": "Align self", "flex-direction": "Direction", "flex-wrap": "Wrap", flex: "Flex", "grid-template-columns": "Columns",
+  "grid-template-rows": "Rows", transition: "Transition", transform: "Transform", cursor: "Cursor", "box-sizing": "Box sizing",
+  "object-fit": "Image fit", "overflow-wrap": "Word breaking", "word-break": "Word breaking", "pointer-events": "Clicks", "aspect-ratio": "Aspect ratio", outline: "Outline", "outline-offset": "Outline offset",
+};
+const friendly = (prop: string) => (prop.startsWith("--") ? prop : FRIENDLY[prop] ?? prop);
+const isColorish = (prop: string, value: string) =>
+  /color|^background$|^fill$|^stroke$/.test(prop) && typeof CSS !== "undefined" && CSS.supports("color", value);
+
+/** Page-wide defaults (`*`, `html`, `body`) and styles not written in a source file (Tailwind's). */
+const isBase = (m: Match) => !m.live.source || /^(\*|html|body|:root|:host)(?![\w-])/.test(m.part.trim());
+
+function AllStyles({ el, cas, target }: { el: Element; cas: Cascade; target: Match | null }) {
+  const states = cas.matches.filter((m) => m.state && m.live.source);
+  const screens = cas.matches.filter((m) => !m.state && !m.active && m.live.source);
+  const here = cas.matches.filter((m) => !m.state && m.active && !isBase(m));
+  const base = cas.matches.filter((m) => !states.includes(m) && !screens.includes(m) && !here.includes(m));
+  const card = (m: Match) => <StyleCard key={m.live.key} m={m} cas={cas} isTarget={m === target} />;
+  return (
+    <div className="grid grid-cols-[minmax(0,1fr)] gap-4 p-3">
+      <div className="flex items-start justify-between gap-2">
+        <p className="text-[11px] leading-relaxed text-muted-foreground">Strongest first. Where two styles set the same thing, the higher one wins; the other is marked <i>overridden</i>.</p>
+        <NewRule el={el} cas={cas} />
+      </div>
+      {cas.matches.length === 0 && <p className="text-muted-foreground">No style in the project's CSS applies to this element.</p>}
+      {here.length > 0 && <Group title="On this element" hint="Applies now, at this screen size.">{here.map(card)}</Group>}
+      {screens.length > 0 && <Group title="Other screen sizes" hint="Applies at other widths only. Edit the phone layout from here.">{screens.map(card)}</Group>}
+      {states.length > 0 && <Group title="Hover, focus and other states" hint="Applies while the element is hovered, focused…">{states.map(card)}</Group>}
+      {base.length > 0 && (
+        <Collapsible className="grid gap-2">
+          <CollapsibleTrigger className="group flex items-center gap-1 text-left">
+            <ChevronRight className="size-3 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
+            <SectionTitle>Base styles · {base.length}</SectionTitle>
+            <span className="ml-1 text-[10.5px] text-muted-foreground">page-wide defaults and framework styles</span>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="grid grid-cols-[minmax(0,1fr)] gap-2">{base.map(card)}</CollapsibleContent>
+        </Collapsible>
+      )}
     </div>
   );
 }
 
-// ---------- every matching rule, editable as written
+function Group({ title, hint, children }: { title: string; hint: string; children: ReactNode }) {
+  return (
+    <section className="grid grid-cols-[minmax(0,1fr)] gap-2">
+      <div className="grid gap-0.5"><SectionTitle>{title}</SectionTitle><p className="text-[10.5px] text-muted-foreground">{hint}</p></div>
+      {children}
+    </section>
+  );
+}
 
-function RuleCard({ m, cas, isTarget }: { m: Match; cas: Cascade; isTarget: boolean }) {
+function StyleCard({ m, cas, isTarget }: { m: Match; cas: Cascade; isTarget: boolean }) {
   const key = m.live.key;
   const src = m.live.source;
   const decls = store.declsOf(key);
+  const [adding, setAdding] = useState(false);
   const [prop, setProp] = useState("");
   const [val, setVal] = useState("");
   const changed = store.edits.has(key);
   const set = (fn: (d: Decl[]) => Decl[]) => store.setDecls(key, fn(store.declsOf(key)));
 
   return (
-    <div className={cn("grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-lg border bg-card p-2.5", isTarget && "border-primary/60 ring-1 ring-primary/30", (!m.active || m.state) && "opacity-75")}>
+    <div className={cn("grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2 rounded-lg border bg-card p-2.5", isTarget && "border-primary/60 ring-1 ring-primary/30")}>
       <div className="flex items-start gap-2">
         <code className="min-w-0 flex-1 font-mono text-[11.5px] break-words text-code" title={m.live.rule.selectorText}>{m.live.rule.selectorText}</code>
         {changed && (
-          <Tip label="Undo the changes to this rule">
+          <Tip label="Undo the changes to this style">
             <Button size="icon-sm" variant="ghost" aria-label="Revert" className="size-5" onClick={() => store.revert(key)}><Undo2 /></Button>
           </Tip>
         )}
-        {src && !isTarget && !m.state && (
-          <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => { store.target = key; store.emit(); }}>Edit in Design</Button>
+        {isTarget ? <Badge variant="outline">In Design</Badge> : src && !m.state && (
+          <Tip label="Edit this style with the Design controls">
+            <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => { store.target = key; store.emit(); }}>Use in Design</Button>
+          </Tip>
         )}
       </div>
       <RuleMeta m={m} />
       {!src ? (
-        <p className="text-[11px] text-muted-foreground">Generated (e.g. by Tailwind), not written in a source file, so read-only: <code className="font-mono break-all">{m.live.rule.style.cssText}</code></p>
+        <p className="text-[11px] text-muted-foreground">Made by a framework (such as Tailwind), not written in your CSS, so it can't be edited here: <code className="font-mono break-all">{m.live.rule.style.cssText}</code></p>
       ) : (
         <div className="grid gap-1">
           {decls.map((d, i) => {
             const applied = cas.applied.has(`${key}#${i}`) || !!m.state || !m.active;
+            const swatch = isColorish(d.prop, d.value);
             return (
-              <div key={`${d.prop}-${i}`} className="group grid grid-cols-[104px_minmax(0,1fr)_20px] items-center gap-1.5" title={applied ? undefined : "Overridden by a stronger rule"}>
-                <span className={cn("truncate font-mono text-[11px] text-prop", !applied && "text-muted-foreground line-through")}>{d.prop}</span>
-                <ValueInput prop={d.prop} value={d.value + (d.important ? " !important" : "")} className={cn("h-6", !applied && "line-through")}
-                  onChange={(v) => set((ds) => ds.map((x, j) => (j === i ? parseDecl(d.prop, v) : x)))}
-                  onClear={() => set((ds) => ds.filter((_, j) => j !== i))} />
+              <div key={`${d.prop}-${i}`} className={cn("group grid grid-cols-[100px_minmax(0,1fr)_20px] items-center gap-1.5", !applied && "opacity-60")}>
+                <Tip label={applied ? d.prop : `${d.prop}: overridden, a stronger style sets this`}>
+                  <span className="grid min-w-0 leading-tight">
+                    <span className="truncate text-[11.5px] text-foreground">{friendly(d.prop)}</span>
+                    {!applied && <span className="text-[9.5px] text-warning">overridden</span>}
+                  </span>
+                </Tip>
+                <div className="relative min-w-0">
+                  {swatch && <span className="pointer-events-none absolute top-1/2 left-1.5 size-3.5 -translate-y-1/2 rounded-sm border shadow-xs" style={{ background: d.value }} />}
+                  <ValueInput prop={d.prop} value={d.value + (d.important ? " !important" : "")} className={cn("h-6", swatch && "pl-6")}
+                    onChange={(v) => set((ds) => ds.map((x, j) => (j === i ? parseDecl(d.prop, v) : x)))}
+                    onClear={() => set((ds) => ds.filter((_, j) => j !== i))} />
+                </div>
                 <Button size="icon-sm" variant="ghost" aria-label={`Remove ${d.prop}`} className="size-5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
                   onClick={() => set((ds) => ds.filter((_, j) => j !== i))}><X /></Button>
               </div>
             );
           })}
-          <form className="grid grid-cols-[104px_minmax(0,1fr)_20px] items-center gap-1.5" onSubmit={(e) => {
-            e.preventDefault();
-            if (!prop.trim() || !val.trim()) return;
-            set((ds) => writeProp(ds, prop.trim(), val.trim()));
-            setProp("");
-            setVal("");
-          }}>
-            <Input className="h-6" list="domeditor-props" placeholder="+ property" value={prop} onChange={(e) => setProp(e.target.value)} aria-label="New property" />
-            <Input className="h-6" placeholder="value" value={val} onChange={(e) => setVal(e.target.value)} aria-label="New value" />
-            <Button type="submit" size="icon-sm" variant="ghost" aria-label="Add" className="size-5"><CornerDownLeft /></Button>
-          </form>
+          {adding ? (
+            <form className="grid grid-cols-[100px_minmax(0,1fr)_20px] items-center gap-1.5" onSubmit={(e) => {
+              e.preventDefault();
+              if (!prop.trim() || !val.trim()) return;
+              set((ds) => writeProp(ds, prop.trim(), val.trim()));
+              setProp("");
+              setVal("");
+              setAdding(false);
+            }}>
+              <Input className="h-6" list="domeditor-props" placeholder="property" value={prop} onChange={(e) => setProp(e.target.value)} aria-label="New property" autoFocus />
+              <Input className="h-6" placeholder="value" value={val} onChange={(e) => setVal(e.target.value)} aria-label="New value" />
+              <Button type="submit" size="icon-sm" variant="ghost" aria-label="Add" className="size-5"><CornerDownLeft /></Button>
+            </form>
+          ) : (
+            <Button variant="ghost" size="sm" className="justify-self-start text-muted-foreground" onClick={() => setAdding(true)}><Plus /> Add a style</Button>
+          )}
         </div>
       )}
     </div>
@@ -685,13 +972,15 @@ function NewRule({ el, cas }: { el: Element; cas: Cascade }) {
   const [file, setFile] = useState("");
   if (!open) {
     return (
-      <Button size="sm" variant="ghost" onClick={() => {
-        setSel(suggestSelector(el));
-        // the page's own stylesheet rather than a global one, where there is one
-        const own = cas.matches.find((m) => m.live.source && !/(^|\/)(globals?|index|styles?|main|app)\.css$/.test(m.live.ref.file));
-        setFile(own?.live.ref.file ?? cas.matches.find((m) => m.live.source)?.live.ref.file ?? store.files[0] ?? "");
-        setOpen(true);
-      }}><Plus /> New rule</Button>
+      <Tip label="Create a new style for this element in a CSS file">
+        <Button size="sm" variant="outline" onClick={() => {
+          setSel(suggestSelector(el));
+          // the page's own stylesheet rather than a global one, where there is one
+          const own = cas.matches.find((m) => m.live.source && !/(^|\/)(globals?|index|styles?|main|app)\.css$/.test(m.live.ref.file));
+          setFile(own?.live.ref.file ?? cas.matches.find((m) => m.live.source)?.live.ref.file ?? store.files[0] ?? "");
+          setOpen(true);
+        }}><Plus /> New style</Button>
+      </Tip>
     );
   }
   return (
@@ -700,13 +989,17 @@ function NewRule({ el, cas }: { el: Element; cas: Cascade }) {
       await store.createRule(file, sel);
       setOpen(false);
     }}>
-      <Input value={sel} onChange={(e) => setSel(e.target.value)} aria-label="Selector" autoFocus />
-      <NativeSelect value={file} onChange={(e) => setFile(e.target.value)} aria-label="File">
-        {store.files.map((f) => <option key={f} value={f}>{f}</option>)}
-      </NativeSelect>
+      <label className="grid gap-1 text-[10.5px] text-muted-foreground">Which elements (a CSS selector)
+        <Input value={sel} onChange={(e) => setSel(e.target.value)} aria-label="Selector" autoFocus />
+      </label>
+      <label className="grid gap-1 text-[10.5px] text-muted-foreground">In file
+        <NativeSelect value={file} onChange={(e) => setFile(e.target.value)} aria-label="File">
+          {store.files.map((f) => <option key={f} value={f}>{f}</option>)}
+        </NativeSelect>
+      </label>
       <div className="flex justify-end gap-1.5">
         <Button size="sm" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
-        <Button size="sm" type="submit">Add rule</Button>
+        <Button size="sm" type="submit">Add style</Button>
       </div>
     </form>
   );
@@ -716,8 +1009,9 @@ function NewRule({ el, cas }: { el: Element; cas: Cascade }) {
 
 function Footer() {
   const [saving, setSaving] = useState(false);
-  const n = store.edits.size;
+  const n = store.pending;
   const files = [...new Set([...store.edits.keys()].map((k) => store.sources.get(k)?.file).filter(Boolean))] as string[];
+  const what = [store.edits.size ? `${store.edits.size} style${store.edits.size === 1 ? "" : "s"}` : "", store.texts.size ? `${store.texts.size} text${store.texts.size === 1 ? "" : "s"}` : ""].filter(Boolean).join(" and ");
   const msg = store.message;
   return (
     <footer className="grid shrink-0 gap-2 border-t bg-background px-3 py-2.5">
@@ -732,13 +1026,19 @@ function Footer() {
         <Collapsible>
           <CollapsibleTrigger className="group flex w-full items-center gap-1 text-left text-[11px] text-warning hover:underline">
             <ChevronRight className="size-3 transition-transform group-data-[state=open]:rotate-90" />
-            {n} rule{n === 1 ? "" : "s"} changed in {files.map(shortFile).join(", ")}
+            {what} changed{files.length ? ` in ${files.map(shortFile).join(", ")}` : ""}
           </CollapsibleTrigger>
           <CollapsibleContent className="mt-1.5 grid gap-1 pl-4">
             {[...store.edits.keys()].map((k) => (
               <div key={k} className="flex items-center justify-between gap-2">
                 <code className="truncate font-mono text-[11px] text-code">{store.sources.get(k)?.selector}</code>
                 <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => store.revert(k)}><Undo2 className="size-3" /> Revert</Button>
+              </div>
+            ))}
+            {[...store.texts.values()].map((c, i) => (
+              <div key={i} className="flex items-center justify-between gap-2">
+                <span className="truncate text-[11px]">“{short(c.after, 34)}”</span>
+                <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => store.revertText(c.node)}><Undo2 className="size-3" /> Revert</Button>
               </div>
             ))}
           </CollapsibleContent>

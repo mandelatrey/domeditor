@@ -2,6 +2,7 @@
 // page's CSS and the panel's never meet. The framework adapters call it; call it yourself elsewhere.
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { toRgba } from "./color";
 import { store } from "./model";
 import { Panel, setHost } from "./Panel";
 import { PortalContainer } from "./ui/portal";
@@ -11,9 +12,11 @@ import css from "./styles.generated";
 export type MountOptions = {
   /** The dev-server endpoint (domeditor/vite serves /__domeditor; the Next route /api/dev/domeditor). */
   endpoint?: string;
-  /** Panel colours. Default: "dark". */
-  theme?: "dark" | "light" | "system";
+  /** Panel colours. "auto" (the default) follows the page: its light/dark switch, or else the system setting. */
+  theme?: Theme;
 };
+
+export type Theme = "auto" | "dark" | "light" | "system";
 
 let mounted = false;
 
@@ -31,13 +34,24 @@ export function mountDomEditor(options: MountOptions = {}) {
   shadow.appendChild(root);
   setHost(host);
 
-  const theme = options.theme ?? "dark";
+  const theme = options.theme ?? "auto";
   const applyTheme = () => {
-    const dark = theme === "dark" || (theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+    const dark = theme === "dark" || (theme === "system" && systemDark()) || (theme === "auto" && pageIsDark());
     root.className = `domeditor${dark ? " dark" : ""}`;
   };
   applyTheme();
-  if (theme === "system") matchMedia("(prefers-color-scheme: dark)").addEventListener("change", applyTheme);
+  if (theme === "system" || theme === "auto") matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => setTimeout(applyTheme, 50));
+  if (theme === "auto") {
+    // the page's theme switch: an attribute or class on <html>/<body>; background colours may fade, so look twice
+    let timers: number[] = [];
+    const again = () => {
+      timers.forEach(clearTimeout);
+      timers = [0, 150, 500].map((ms) => window.setTimeout(applyTheme, ms));
+    };
+    const watch = { attributes: true, attributeFilter: ["class", "style", "data-theme", "data-mode", "data-color-scheme"] };
+    new MutationObserver(again).observe(document.documentElement, watch);
+    new MutationObserver(again).observe(document.body, watch);
+  }
 
   document.body.appendChild(host);
   createRoot(root).render(
@@ -80,4 +94,21 @@ function watchStylesheets() {
     }
     if (changed) reload();
   }).observe(document.head, { childList: true, subtree: true, characterData: true });
+}
+
+const systemDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
+
+/** Whether the page is showing its dark theme: an explicit data-theme / class on <html> or <body>,
+ *  else how dark its background is, else the system setting. */
+function pageIsDark(): boolean {
+  for (const el of [document.documentElement, document.body]) {
+    const said = `${el.getAttribute("data-theme") ?? ""} ${el.getAttribute("data-mode") ?? ""} ${el.getAttribute("data-color-scheme") ?? ""}`.toLowerCase();
+    if (/\bdark\b/.test(said) || el.classList.contains("dark")) return true;
+    if (/\blight\b/.test(said) || el.classList.contains("light")) return false;
+  }
+  for (const el of [document.body, document.documentElement]) {
+    const rgba = toRgba(getComputedStyle(el).backgroundColor);
+    if (rgba && rgba[3] > 0.5) return 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2] < 128;
+  }
+  return systemDark();
 }

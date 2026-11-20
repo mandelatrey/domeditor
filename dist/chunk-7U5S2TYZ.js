@@ -2,7 +2,7 @@ import {
   normCondition,
   normSelector,
   sameDecls
-} from "./chunk-LBGJCDWO.js";
+} from "./chunk-5L7PTTPN.js";
 
 // src/core/server.ts
 import { readdirSync, readFileSync, writeFileSync } from "fs";
@@ -97,8 +97,58 @@ ${decls.map((d) => `  ${text(d)}
   return `${css.replace(/\s*$/, "\n")}${selector.trim()} {${body}}
 `;
 }
+var TEXT_EXT = /\.(tsx|jsx|ts|js|mjs|mdx|md|html|vue|svelte|astro)$/;
+var escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+var SPELLINGS = {
+  "'": "(?:'|&apos;|&#39;|&rsquo;|\\\\')",
+  "\u2019": "(?:\u2019|&rsquo;|')",
+  '"': '(?:"|&quot;|&#34;|\\\\")',
+  "&": "(?:&|&amp;)",
+  "\xA0": "(?:\xA0|&nbsp;|&#160;|\\s)"
+};
+function textPattern(text) {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  let src = "";
+  for (const ch of t) src += ch === " " ? "\\s+" : SPELLINGS[ch] ?? escapeRe(ch);
+  return new RegExp(src, "g");
+}
+function findTextIn(content, file, text) {
+  const re = textPattern(text);
+  if (!re) return [];
+  const prose = /\.mdx?$/.test(file);
+  const out = [];
+  for (const m of content.matchAll(re)) {
+    const start = m.index, end = start + m[0].length;
+    const q = content[start - 1];
+    const quoted = (q === '"' || q === "'" || q === "`") && content[end] === q;
+    const prev = /\S?(?=\s*$)/.exec(content.slice(Math.max(0, start - 200), start))?.[0] ?? "";
+    const next = /^\s*(\S?)/.exec(content.slice(end, end + 200))?.[1] ?? "";
+    const markup = (prev === ">" || prev === "}" || prev === "") && (next === "<" || next === "{" || next === "");
+    const word = (a, b) => !!a && !!b && /\w/.test(a) && /\w/.test(b);
+    if (!quoted && !markup && !(prose && !word(content[start - 1], m[0][0]) && !word(m[0].at(-1), content[end]))) continue;
+    out.push({ file, line: content.slice(0, start).split("\n").length, index: start, length: m[0].length });
+  }
+  return out;
+}
+function replaceText(content, hit, after) {
+  const q = content[hit.index - 1];
+  const inString = (q === '"' || q === "'" || q === "`") && content[hit.index + hit.length] === q;
+  let text = after.replace(/\s+/g, " ").trim();
+  if (!text) throw new EditError("the text cannot be empty: delete it in the code");
+  if (inString) {
+    text = text.replace(/\\/g, "\\\\").replaceAll(q, `\\${q}`);
+    if (q === "`") text = text.replace(/\$\{/g, "\\${");
+  } else if (/[{}<>]/.test(text)) {
+    throw new EditError("text with { } < or > has to be changed in the code");
+  }
+  return content.slice(0, hit.index) + text + content.slice(hit.index + hit.length);
+}
 var SKIP = ["node_modules", ".git", ".next", ".turbo", ".vercel", ".svelte-kit", "dist", "build", "out", "coverage", "public"];
 function cssFiles(root, include = ["."], exclude = []) {
+  return projectFiles(root, include, exclude, /\.css$/);
+}
+function projectFiles(root, include = ["."], exclude = [], match) {
   const skip = /* @__PURE__ */ new Set([...SKIP, ...exclude]);
   const seen = /* @__PURE__ */ new Set();
   const walk = (dir) => {
@@ -111,13 +161,23 @@ function cssFiles(root, include = ["."], exclude = []) {
     return entries.flatMap((e) => {
       const p = join(dir, e.name);
       if (e.isDirectory()) return skip.has(e.name) || e.name.startsWith(".") ? [] : walk(p);
-      return e.name.endsWith(".css") ? [p] : [];
+      return match.test(e.name) ? [p] : [];
     });
   };
   for (const d of include) for (const f of walk(resolve(root, d))) seen.add(relative(root, f).split(sep).join("/"));
   return [...seen].filter((f) => !f.startsWith("..")).sort();
 }
+var TextError = class extends EditError {
+  constructor(message, text, hits) {
+    super(message);
+    this.text = text;
+    this.hits = hits;
+  }
+  text;
+  hits;
+};
 var json = (status, data) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+var clip = (s) => s.length > 40 ? `${s.slice(0, 39)}\u2026` : s;
 function createHandler(options = {}) {
   return async (req) => {
     if (process.env.NODE_ENV !== "development") return json(404, { error: "not found" });
@@ -137,7 +197,17 @@ function createHandler(options = {}) {
       if (req.method === "POST") {
         const text = await req.text();
         if (text.length > 1e6) throw new EditError("request too large");
-        const { edits = [], create } = JSON.parse(text);
+        const { edits = [], create, texts = [], find } = JSON.parse(text);
+        const sources = () => projectFiles(root, options.include, options.exclude, TEXT_EXT);
+        const lookup = (t, read2) => sources().flatMap((f) => {
+          const c = read2(f);
+          return c.length > 2e6 ? [] : findTextIn(c, f, t);
+        });
+        if (find) {
+          const cache = /* @__PURE__ */ new Map();
+          const readOnce = (f) => cache.get(f) ?? (cache.set(f, read(f)), cache.get(f));
+          return json(200, { found: find.map((t) => lookup(t, readOnce).map(({ file, line }) => ({ file, line }))) });
+        }
         const byFile = /* @__PURE__ */ new Map();
         const current = (f) => {
           if (!files.includes(f)) throw new EditError(`not an editable stylesheet: ${f}`);
@@ -145,12 +215,26 @@ function createHandler(options = {}) {
         };
         for (const e of edits) byFile.set(e.ref.file, applyRuleEdit(current(e.ref.file), e));
         if (create) byFile.set(create.file, appendRule(current(create.file), create.selector, create.decls));
+        if (texts.length) {
+          const editable = new Set(sources());
+          const now = (f) => byFile.get(f) ?? read(f);
+          for (const t of texts) {
+            let hits = lookup(t.before, now);
+            if (t.at) hits = hits.filter((h) => h.file === t.at.file && h.line === t.at.line);
+            if (hits.length === 0) throw new TextError(`"${clip(t.before)}" is not written in the code (it may come from data)`, t.before, []);
+            if (hits.length > 1) throw new TextError(`"${clip(t.before)}" is written in ${hits.length} places: choose one`, t.before, hits);
+            const hit = hits[0];
+            if (!editable.has(hit.file)) throw new EditError(`not an editable file: ${hit.file}`);
+            byFile.set(hit.file, replaceText(now(hit.file), hit, t.after));
+          }
+        }
         for (const [f, css] of byFile) writeFileSync(join(root, f), css);
         return json(200, { ok: true, files: [...byFile.keys()] });
       }
       return json(405, { error: "method not allowed" });
     } catch (err) {
-      return json(err instanceof EditError ? 409 : 400, { error: err instanceof Error ? err.message : String(err) });
+      const text = err instanceof TextError ? { text: err.text, hits: err.hits.map(({ file, line }) => ({ file, line })) } : {};
+      return json(err instanceof EditError ? 409 : 400, { error: err instanceof Error ? err.message : String(err), ...text });
     }
   };
 }
@@ -160,6 +244,11 @@ export {
   sourceRules,
   applyRuleEdit,
   appendRule,
+  textPattern,
+  findTextIn,
+  replaceText,
   cssFiles,
+  projectFiles,
+  TextError,
   createHandler
 };

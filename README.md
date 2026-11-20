@@ -1,20 +1,28 @@
 # domeditor
 
-A development-only visual CSS editor. Point at anything on the page, adjust type, spacing and layout with
-live preview, and **save the change into the `.css` file the rule came from**. Your files keep their
-formatting, so the result is an ordinary `git diff`.
+A development-only visual editor. Point at anything on the page, adjust type, spacing and layout, or change
+its words, with live preview, and **save the change into the file it came from**: styles into the `.css`
+rule, text into the component it is written in. Your files keep their formatting, so the result is an
+ordinary `git diff`.
 
 Works with **Next.js** (App Router, Turbopack or webpack) and **Vite**. It never ships: there is nothing
 of it in a production build.
 
 - **Pick** an element, or <kbd>Alt</kbd>+click anything. The page shows its margin, padding and the gaps between its children.
-- **Design** tab: font size, line height, weight, tracking, alignment, a box model for margin and padding,
-  flex/grid alignment and gaps, width. Change a value by typing, with <kbd>↑</kbd>/<kbd>↓</kbd> on any number
-  (<kbd>Shift</kbd> ×10, <kbd>Alt</kbd> ×0.1), or by dragging a label sideways. Shorthands are edited in place
-  (`padding: 18px 20px` stays one line).
-- **Rules** tab: every rule that applies to the element, including ones for other screen widths and states,
-  editable as written. Values another rule overrides are struck through; a control that a stronger rule beats
-  says so and takes you to that rule.
+- **Design** tab:
+  - **Text**: the element's words. Edit them in place; Save writes the new copy into the component where it
+    is written (a JSX text or a `"string"`). Text that comes from data (a product name, a shop name) is
+    marked as such; text written in more than one place asks which one you mean.
+  - **Typography**: size with −/+, a slider and common sizes (a responsive `clamp()` size is shown as
+    *smallest* and *largest*), weight by name (Regular 400, Semibold 600…), line height with presets,
+    letter spacing, text colour, alignment.
+  - **Spacing** (a box model for margin and padding, and gaps), **layout** (flex/grid alignment) and **size**.
+  - Type values, use −/+, or <kbd>↑</kbd>/<kbd>↓</kbd> on any number (<kbd>Shift</kbd> ×10, <kbd>Alt</kbd> ×0.1).
+    Shorthands are edited in place (`padding: 18px 20px` stays one line; `font: 650 clamp(…)/1.04 …` keeps its shape).
+- **All styles** tab: every style that applies to the element, grouped as *on this element*, *other screen
+  sizes* ("Screens up to 640px wide"), *hover, focus and other states*, and collapsed *base styles*
+  (page-wide defaults, framework styles). Properties have plain names, colours show a swatch, and a value a
+  stronger style beats is marked *overridden*.
 - **Save** (<kbd>Ctrl/⌘</kbd>+<kbd>S</kbd>) writes the changes. The dev server reloads the CSS.
 - <kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>E</kbd> opens and closes the panel.
 
@@ -25,6 +33,10 @@ npm i -D github:mandelatrey/domeditor
 ```
 
 React 18 or 19 is the only requirement; everything else the panel uses is bundled.
+
+npm 12 and later refuse git dependencies unless a project allows them. If `npm i` stops with `EALLOWGIT`,
+add `--allow-git=root` (allows only git dependencies listed in your own `package.json`), or put
+`allow-git=root` in the project's `.npmrc` so every install, including CI, gets it.
 
 ### Vite
 
@@ -78,7 +90,7 @@ That is all: the plugin serves the editor's endpoint and adds the panel to `inde
 
 | Option | Where | Default | |
 |---|---|---|---|
-| `theme` | `domeditor({ theme })`, `<DomEditor theme />` | `"dark"` | `"dark"`, `"light"` or `"system"` |
+| `theme` | `domeditor({ theme })`, `<DomEditor theme />` | `"auto"` | `"auto"` follows the page: its own light/dark switch (`data-theme`, a `dark`/`light` class), else its background, else the system. Or `"dark"`, `"light"`, `"system"`. |
 | `include` | `domeditor({ include })`, `createHandler({ include })` | the whole project | folders (relative to the root) to look for `.css` in |
 | `exclude` | same | | folder names to skip, on top of `node_modules`, `.next`, `dist`, `build`, `out`, `public`... |
 | `endpoint` | `domeditor({ endpoint })`, `<DomEditor endpoint />` | `/__domeditor` (Vite), `/api/dev/domeditor` (Next) | |
@@ -88,7 +100,11 @@ handler, and `mountDomEditor({ endpoint })` from `domeditor/client` adds the pan
 
 ## What it edits
 
-Plain `.css` files in your project: global stylesheets, per-route CSS, CSS imported from components. It finds
+**Text** written in your components and pages (`.tsx`, `.jsx`, `.ts`, `.js`, `.html`, `.md`, `.mdx`, `.vue`,
+`.svelte`, `.astro`): a run of JSX text between tags, or a whole string. Text with `{ } < >` in it is left to
+the code.
+
+**Styles** in plain `.css` files in your project: global stylesheets, per-route CSS, CSS imported from components. It finds
 each rule the browser has in its source file:
 
 - **Vite** names each stylesheet by its file.
@@ -104,7 +120,8 @@ and inline `style={{...}}` (flagged, since it beats the CSS: change it in the co
 ### Safety
 
 - The endpoint only runs when `NODE_ENV` is `"development"`, only answers requests from the page itself (a
-  custom header forces a CORS preflight on other sites), and only writes `.css` files it found in the project.
+  custom header forces a CORS preflight on other sites), and only writes `.css` files and source files of the
+  types above that it found in the project (never `node_modules`, build output or dot-folders).
 - An edit is refused if the rule changed on disk since the panel read it (reload and try again). If any edit in
   a save is refused, no file is written.
 
