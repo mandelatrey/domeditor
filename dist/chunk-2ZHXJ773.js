@@ -144,6 +144,48 @@ function replaceText(content, hit, after) {
   }
   return content.slice(0, hit.index) + text + content.slice(hit.index + hit.length);
 }
+var ENTITIES = { "&apos;": "'", "&#39;": "'", "&quot;": '"', "&#34;": '"', "&amp;": "&", "&nbsp;": " ", "&#160;": " ", "&rsquo;": "\u2019", "&lsquo;": "\u2018", "&ldquo;": "\u201C", "&rdquo;": "\u201D" };
+var squashText = (t) => t.replace(/\s+/g, " ").trim();
+function literalsIn(content) {
+  const out = [];
+  const add = (raw, index, js) => {
+    let t = js ? raw.replace(/\\(["'`\\])/g, "$1").replace(/\\n/g, " ") : raw;
+    t = squashText(t.replace(/&[#\w]+;/g, (e) => ENTITIES[e] ?? e));
+    if (t.length >= 6 && /\p{L}/u.test(t)) out.push({ text: t, index });
+  };
+  for (const m of content.matchAll(/"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`/g)) {
+    add(m[1] ?? m[2] ?? m[3] ?? "", m.index + 1, true);
+  }
+  for (const m of content.matchAll(/[>}]([^<>{}]+)[<{]/g)) add(m[1], m.index + 1 + (m[1].length - m[1].trimStart().length), false);
+  return out;
+}
+function findPieces(files, shown) {
+  const target = squashText(shown);
+  if (target.length < 6) return [];
+  const cands = [];
+  for (const { file, content } of files) {
+    for (const lit of literalsIn(content)) {
+      for (let at = target.indexOf(lit.text); at >= 0; at = target.indexOf(lit.text, at + 1)) {
+        if (/\w/.test(target[at - 1] ?? "") && /^\w/.test(lit.text)) continue;
+        if (/\w/.test(target[at + lit.text.length] ?? "") && /\w$/.test(lit.text)) continue;
+        cands.push({ file, line: content.slice(0, lit.index).split("\n").length, text: lit.text, start: at, end: at + lit.text.length });
+      }
+    }
+  }
+  if (!cands.length) return [];
+  cands.sort((a, b) => a.end - b.end || b.start - a.start);
+  const best = [];
+  for (let i = 0; i < cands.length; i++) {
+    const c = cands[i];
+    let j = i - 1;
+    while (j >= 0 && cands[j].end > c.start) j--;
+    const take = { covered: (j >= 0 ? best[j].covered : 0) + (c.end - c.start), pick: [...j >= 0 ? best[j].pick : [], c] };
+    const skip = i > 0 ? best[i - 1] : { covered: 0, pick: [] };
+    best.push(take.covered > skip.covered || take.covered === skip.covered && take.pick.length < skip.pick.length ? take : skip);
+  }
+  const { covered, pick } = best.at(-1);
+  return covered >= target.replace(/[^\p{L}\p{N}]/gu, "").length * 0.5 ? pick : [];
+}
 var SKIP = ["node_modules", ".git", ".next", ".turbo", ".vercel", ".svelte-kit", "dist", "build", "out", "coverage", "public"];
 function cssFiles(root, include = ["."], exclude = []) {
   return projectFiles(root, include, exclude, /\.css$/);
@@ -197,12 +239,16 @@ function createHandler(options = {}) {
       if (req.method === "POST") {
         const text = await req.text();
         if (text.length > 1e6) throw new EditError("request too large");
-        const { edits = [], create, texts = [], find } = JSON.parse(text);
+        const { edits = [], create, texts = [], find, pieces } = JSON.parse(text);
         const sources = () => projectFiles(root, options.include, options.exclude, TEXT_EXT);
         const lookup = (t, read2) => sources().flatMap((f) => {
           const c = read2(f);
           return c.length > 2e6 ? [] : findTextIn(c, f, t);
         });
+        if (pieces) {
+          const files2 = sources().map((f) => ({ file: f, content: read(f) })).filter((f) => f.content.length <= 2e6);
+          return json(200, { pieces: pieces.map((t) => findPieces(files2, t)) });
+        }
         if (find) {
           const cache = /* @__PURE__ */ new Map();
           const readOnce = (f) => cache.get(f) ?? (cache.set(f, read(f)), cache.get(f));
@@ -247,6 +293,8 @@ export {
   textPattern,
   findTextIn,
   replaceText,
+  literalsIn,
+  findPieces,
   cssFiles,
   projectFiles,
   TextError,

@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createHandler, findTextIn, replaceText } from "../src/core/server";
+import { createHandler, findPieces, findTextIn, literalsIn, replaceText } from "../src/core/server";
 import { composeClamp, describeCondition, describeState, parseClamp, weightName } from "../src/core/shared";
 
 describe("plain words", () => {
@@ -109,5 +109,36 @@ describe("text changes through the handler", () => {
     const data = await post({ texts: [{ before: "iDear", after: "x" }] });
     expect(data.status).toBe(409);
     expect((await data.json()).error).toMatch(/not written in the code/);
+  });
+});
+
+describe("text a script split up", () => {
+  const page = {
+    file: "app/page.tsx",
+    content: `const STATEMENT =
+  "Haali gives social sellers one place to manage their catalogue, post drops that look like a brand, and turn every status view into an order they can actually fulfil.";
+const MAIN = "Turn your WhatsApp status";
+const SOFT = 'into an online marketplace';
+export const Hero = () => <h1><Words text={MAIN} /> <Words text={SOFT} /></h1>;
+export const Note = () => <p>Orders arrive <b>already written</b> out.</p>;
+`,
+  };
+  // what the page shows: the words, each in its own span, joined again
+  const shown = (s: string) => s.split(" ").join(" ");
+
+  it("finds the one constant a sentence was split from", () => {
+    const text = shown("Haali gives social sellers one place to manage their catalogue, post drops that look like a brand, and turn every status view into an order they can actually fulfil.");
+    const pieces = findPieces([page], text);
+    expect(pieces.map((p) => [p.line, p.start, p.end])).toEqual([[2, 0, text.length]]);
+  });
+  it("finds several strings that together make up a text", () => {
+    const pieces = findPieces([page], "Turn your WhatsApp status into an online marketplace");
+    expect(pieces.map((p) => [p.line, p.text])).toEqual([[3, "Turn your WhatsApp status"], [4, "into an online marketplace"]]);
+  });
+  it("reads JSX text runs and finds nothing for text from data", () => {
+    expect(literalsIn(page.content).map((l) => l.text)).toContain("Orders arrive");
+    expect(findPieces([page], "iDear Technologies sells speakers")).toEqual([]);
+    // a stray matching phrase is not enough to claim a long text
+    expect(findPieces([page], "Turn your WhatsApp status and a great many other words that are not in the code at all")).toEqual([]);
   });
 });

@@ -165,6 +165,64 @@ export function replaceText(content: string, hit: TextHit, after: string): strin
   return content.slice(0, hit.index) + text + content.slice(hit.index + hit.length);
 }
 
+// ---------- text a script split up: find the whole strings it came from
+
+/** A string in the source that makes up part of a text on the page; start/end are offsets in that
+ *  text with its spacing collapsed. */
+export type Piece = { file: string; line: number; text: string; start: number; end: number };
+
+const ENTITIES: Record<string, string> = { "&apos;": "'", "&#39;": "'", "&quot;": '"', "&#34;": '"', "&amp;": "&", "&nbsp;": " ", "&#160;": " ", "&rsquo;": "’", "&lsquo;": "‘", "&ldquo;": "“", "&rdquo;": "”" };
+const squashText = (t: string) => t.replace(/\s+/g, " ").trim();
+
+/** Every string literal and JSX text run in a file, as the page would show it. */
+export function literalsIn(content: string): { text: string; index: number }[] {
+  const out: { text: string; index: number }[] = [];
+  const add = (raw: string, index: number, js: boolean) => {
+    let t = js ? raw.replace(/\\(["'`\\])/g, "$1").replace(/\\n/g, " ") : raw;
+    t = squashText(t.replace(/&[#\w]+;/g, (e) => ENTITIES[e] ?? e));
+    if (t.length >= 6 && /\p{L}/u.test(t)) out.push({ text: t, index });
+  };
+  for (const m of content.matchAll(/"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`/g)) {
+    add(m[1] ?? m[2] ?? m[3] ?? "", m.index! + 1, true);
+  }
+  for (const m of content.matchAll(/[>}]([^<>{}]+)[<{]/g)) add(m[1]!, m.index! + 1 + (m[1]!.length - m[1]!.trimStart().length), false);
+  return out;
+}
+
+/** The source strings that, in order, make up a text the page shows: the largest cover of the text by
+ *  non-overlapping strings (so "Haali gives … fulfil." split into one <span> per word is found as the one
+ *  constant it was split from). Empty if nothing in the code makes up a real part of it. */
+export function findPieces(files: { file: string; content: string }[], shown: string): Piece[] {
+  const target = squashText(shown);
+  if (target.length < 6) return [];
+  const cands: Piece[] = [];
+  for (const { file, content } of files) {
+    for (const lit of literalsIn(content)) {
+      for (let at = target.indexOf(lit.text); at >= 0; at = target.indexOf(lit.text, at + 1)) {
+        // whole words only
+        if (/\w/.test(target[at - 1] ?? "") && /^\w/.test(lit.text)) continue;
+        if (/\w/.test(target[at + lit.text.length] ?? "") && /\w$/.test(lit.text)) continue;
+        cands.push({ file, line: content.slice(0, lit.index).split("\n").length, text: lit.text, start: at, end: at + lit.text.length });
+      }
+    }
+  }
+  if (!cands.length) return [];
+  // weighted interval scheduling: cover as much of the text as possible
+  cands.sort((a, b) => a.end - b.end || b.start - a.start);
+  const best: { covered: number; pick: Piece[] }[] = [];
+  for (let i = 0; i < cands.length; i++) {
+    const c = cands[i]!;
+    let j = i - 1;
+    while (j >= 0 && cands[j]!.end > c.start) j--;
+    const take = { covered: (j >= 0 ? best[j]!.covered : 0) + (c.end - c.start), pick: [...(j >= 0 ? best[j]!.pick : []), c] };
+    const skip = i > 0 ? best[i - 1]! : { covered: 0, pick: [] };
+    best.push(take.covered > skip.covered || (take.covered === skip.covered && take.pick.length < skip.pick.length) ? take : skip);
+  }
+  const { covered, pick } = best.at(-1)!;
+  // worth it only if the strings make up most of the text (not a stray word that happens to match)
+  return covered >= target.replace(/[^\p{L}\p{N}]/gu, "").length * 0.5 ? pick : [];
+}
+
 // ---------- the handler
 
 export type HandlerOptions = {
@@ -212,6 +270,8 @@ type SaveRequest = {
   texts?: TextEdit[];
   /** look up where texts are written, without changing anything */
   find?: string[];
+  /** for texts a script split up: the source strings each is made of */
+  pieces?: string[];
 };
 
 /** A text change that cannot be made as asked: not in the code, or in more than one place. */
@@ -247,13 +307,17 @@ export function createHandler(options: HandlerOptions = {}): (req: Request) => P
       if (req.method === "POST") {
         const text = await req.text();
         if (text.length > 1_000_000) throw new EditError("request too large");
-        const { edits = [], create, texts = [], find } = JSON.parse(text) as SaveRequest;
+        const { edits = [], create, texts = [], find, pieces } = JSON.parse(text) as SaveRequest;
         const sources = () => projectFiles(root, options.include, options.exclude, TEXT_EXT);
         const lookup = (t: string, read: (f: string) => string) =>
           sources().flatMap((f) => {
             const c = read(f);
             return c.length > 2_000_000 ? [] : findTextIn(c, f, t);
           });
+        if (pieces) {
+          const files = sources().map((f) => ({ file: f, content: read(f) })).filter((f) => f.content.length <= 2_000_000);
+          return json(200, { pieces: pieces.map((t) => findPieces(files, t)) });
+        }
         if (find) {
           const cache = new Map<string, string>();
           const readOnce = (f: string) => cache.get(f) ?? (cache.set(f, read(f)), cache.get(f)!);

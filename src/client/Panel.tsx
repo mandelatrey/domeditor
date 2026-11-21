@@ -11,7 +11,8 @@ import {
 } from "../core/shared";
 import { toHex } from "./color";
 import {
-  cascade, conditionLabel, defaultTarget, inheritedFrom, label, shortFile, store, suggestSelector, type Cascade, type Match,
+  cascade, conditionLabel, defaultTarget, inheritedFrom, label, segmentsFor, shortFile, store, suggestSelector, textIndex,
+  type Cascade, type Match, type Piece, type Place, type TextIndex, type TextKey,
 } from "./model";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -302,77 +303,168 @@ function Row({ label, title, note, children }: { label: string; title?: string; 
 
 // ---------- text: the words on the page, saved into the component they are written in
 
-/** The texts an element shows: its own, or (for a container) the texts inside it. */
-function textNodesOf(el: Element): Text[] {
-  const own = Array.from(el.childNodes).filter((n): n is Text => n.nodeType === Node.TEXT_NODE && wordy((n as Text).data));
-  if (own.length) return own;
-  const out: Text[] = [];
-  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
-    acceptNode: (n) => (wordy((n as Text).data) && !n.parentElement?.closest("script,style,noscript,svg,template") ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
-  });
-  while (walker.nextNode() && out.length < 50) out.push(walker.currentNode as Text);
-  return out;
-}
-
 const MAX_TEXTS = 6;
 const ids = new WeakMap<Node, number>();
 let nextId = 0;
 const nodeId = (n: Node) => ids.get(n) ?? (ids.set(n, ++nextId), nextId);
 /** Text worth editing: has a letter or digit (not just the "." after a name). */
 const wordy = (t: string) => /[\p{L}\p{N}]/u.test(t);
+const hidden = (n: Node) => !!n.parentElement?.closest("script,style,noscript,svg,template");
+
+/** The texts an element shows: its own, or (for a container) the texts inside it. */
+function textNodesOf(el: Element): Text[] {
+  const own = Array.from(el.childNodes).filter((n): n is Text => n.nodeType === Node.TEXT_NODE && wordy(store.originalOf(n as Text)));
+  if (own.length) return own;
+  const out: Text[] = [];
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => (wordy(store.originalOf(n as Text)) && !hidden(n) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT),
+  });
+  while (walker.nextNode() && out.length < 50) out.push(walker.currentNode as Text);
+  return out;
+}
+
+/** The element and a few parents: a selected word may be part of a longer text a script split up. */
+function containersOf(el: Element): Element[] {
+  const out = [el];
+  for (let p = el.parentElement; p && p !== document.body && out.length < 4; p = p.parentElement) {
+    if ((p.textContent?.length ?? 0) > 4000) break;
+    out.push(p);
+  }
+  return out;
+}
+
+type Split = { container: Element; index: TextIndex; pieces: Piece[]; rest: string };
 
 function TextSection({ el }: { el: Element }) {
   useStore();
   const nodes = useMemo(() => textNodesOf(el), [el]);
-  const shown = nodes.slice(0, MAX_TEXTS);
+  const indexes = useMemo(() => containersOf(el).map((c) => ({ el: c, index: textIndex(c, store.originalOf) })), [el]);
+  const single = nodes.length === 1 ? squash(store.originalOf(nodes[0]!)) : null;
   useEffect(() => {
-    void store.findPlaces(shown.map((n) => store.texts.get(n)?.original ?? n.data));
+    void store.findPlaces(nodes.slice(0, MAX_TEXTS).map((n) => store.originalOf(n)));
+    void store.findPieces(indexes.map((i) => i.index.full));
   }, [el]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!nodes.length) return null;
+
+  // a text written as it is, in one place: edit it directly
+  const singlePlaces = single ? store.places.get(single) : undefined;
+  const direct = Array.isArray(singlePlaces) && singlePlaces.length === 1;
+  // otherwise a text a script split up (or this element's part of one): edit the strings it came from
+  let split: Split | null = null;
+  if (!direct) {
+    for (const { el: c, index } of indexes) {
+      const found = store.pieces.get(index.full);
+      if (!Array.isArray(found) || !found.length) continue;
+      const mine = index.at.flatMap(([n], k) => (el.contains(n) ? [k] : []));
+      const lo = mine[0] ?? 0, hi = (mine.at(-1) ?? 0) + 1;
+      const pieces = found.filter((p) => p.start < hi && p.end > lo);
+      if (!pieces.length) continue;
+      // what of the element's text no piece covers: from data, or put together in code
+      let rest = "";
+      for (let k = lo; k < hi; k++) rest += pieces.some((p) => k >= p.start && k < p.end) ? " " : index.full[k];
+      split = { container: c, index, pieces, rest: squash(rest).split(" ").filter(wordy).join(" ") };
+      break;
+    }
+  }
+  const looking = !direct && (single !== null && singlePlaces === "looking" || indexes.some((i) => store.pieces.get(i.index.full) === "looking"));
+  const aside = <span className="text-[10.5px] text-muted-foreground">saved into the code</span>;
+
+  if (split) {
+    return (
+      <Section title="Text" aside={aside}>
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          {split.container === el
+            ? "The page splits this text into pieces (for an animation, say). Edit it whole here:"
+            : <>Part of a longer text in <code className="font-mono">{short(label(split.container), 30)}</code> that the page splits into pieces. Edit it whole here:</>}
+        </p>
+        {split.pieces.map((p) => <PieceRow key={`${p.file}:${p.line}:${p.start}`} piece={p} index={split.index} />)}
+        {split.rest && (
+          <p className="inline-flex items-start gap-1 text-[10.5px] text-muted-foreground">
+            <Database className="mt-px size-3 shrink-0" /> “{short(split.rest, 40)}” is not written in the code: it comes from data or is put together by the code.
+          </p>
+        )}
+      </Section>
+    );
+  }
+  if (looking) {
+    return <Section title="Text" aside={aside}><p className="text-[11px] text-muted-foreground">Looking for it in the code…</p></Section>;
+  }
+  const shown = nodes.slice(0, MAX_TEXTS);
   return (
-    <Section title="Text" aside={<span className="text-[10.5px] text-muted-foreground">saved into the code</span>}>
+    <Section title="Text" aside={aside}>
       {shown.map((n) => <TextRow key={nodeId(n)} node={n} label={n.parentElement !== el ? label(n.parentElement!) : undefined} />)}
       {nodes.length > MAX_TEXTS && <p className="text-[11px] text-muted-foreground">{nodes.length - MAX_TEXTS} more inside: select the text itself to change it.</p>}
     </Section>
   );
 }
 
-function TextRow({ node, label: where }: { node: Text; label?: string }) {
-  const c = store.texts.get(node);
-  const original = squash(c?.original ?? node.data);
+/** A text box for one text: keeps what you type while you type, follows undo and saves otherwise. */
+function TextBox({ k, original, onChange, disabled }: { k: TextKey; original: string; onChange: (v: string) => void; disabled?: boolean }) {
+  const c = store.texts.get(k);
   const current = c ? c.after : original;
   const [draft, setDraft] = useState(current);
   const focused = useRef(false);
   useEffect(() => {
     if (!focused.current) setDraft(current);
   }, [current]);
+  return (
+    <Textarea
+      value={draft} disabled={disabled} aria-label="Text" rows={Math.min(6, Math.max(1, Math.ceil(draft.length / 42)))}
+      onFocus={() => { focused.current = true; }} onBlur={() => { focused.current = false; setDraft(current); }}
+      onChange={(e) => { setDraft(e.target.value); onChange(e.target.value); }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") { e.stopPropagation(); store.revertText(k); (e.target as HTMLTextAreaElement).blur(); }
+      }}
+    />
+  );
+}
+
+function PlaceLink({ place }: { place: Place }) {
+  return (
+    <Tip label="Open in your code editor">
+      <Button variant="link" size="sm" className="h-auto gap-1 font-mono text-[10.5px]" onClick={() => openInEditor(place.file, place.line)}>
+        <FileCode className="size-3" />{shortFile(place.file)}:{place.line}
+      </Button>
+    </Tip>
+  );
+}
+
+/** One source string of a split-up text, edited whole; the preview spreads its words over the pieces. */
+function PieceRow({ piece, index }: { piece: Piece; index: TextIndex }) {
+  const k = `piece:${piece.file}:${piece.line}:${piece.text}`;
+  const c = store.texts.get(k);
+  const at = { file: piece.file, line: piece.line };
+  return (
+    <div className="grid gap-1.5">
+      <TextBox k={k} original={piece.text} onChange={(v) => store.setText(k, c?.segments ?? segmentsFor(index, piece.start, piece.end), piece.text, v, at)} />
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
+        <PlaceLink place={at} />
+        {c && <Button variant="ghost" size="sm" className="ml-auto h-5 px-1.5" onClick={() => store.revertText(k)}><Undo2 className="size-3" /> Undo</Button>}
+      </div>
+    </div>
+  );
+}
+
+function TextRow({ node, label: where }: { node: Text; label?: string }) {
+  const c = store.texts.get(node);
+  const raw = store.originalOf(node);
+  const original = squash(raw);
   const places = store.places.get(original);
   const fromData = Array.isArray(places) && places.length === 0;
   const place = c?.at ?? (Array.isArray(places) && places.length === 1 ? places[0] : undefined);
+  const lead = raw.length - raw.trimStart().length;
+  const segments = () => [{ node, from: lead, to: raw.trimEnd().length }];
 
   return (
     <div className="grid gap-1.5">
       {where && <span className="font-mono text-[10.5px] text-muted-foreground">{short(where, 40)}</span>}
-      <Textarea
-        value={draft} disabled={fromData} aria-label="Text" rows={Math.min(5, Math.max(1, Math.ceil(draft.length / 42)))}
-        onFocus={() => { focused.current = true; }} onBlur={() => { focused.current = false; setDraft(current); }}
-        onChange={(e) => { setDraft(e.target.value); store.setText(node, e.target.value); }}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") { e.stopPropagation(); store.revertText(node); (e.target as HTMLTextAreaElement).blur(); }
-        }}
-      />
+      <TextBox k={node} original={original} disabled={fromData} onChange={(v) => store.setText(node, c?.segments ?? segments(), original, v)} />
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
         {places === "looking" && <span>Looking for it in the code…</span>}
         {fromData && (
           <span className="inline-flex items-center gap-1"><Database className="size-3" /> Not written in the code: it comes from data, so change it where the data lives.</span>
         )}
-        {place && (
-          <Tip label="Open in your code editor">
-            <Button variant="link" size="sm" className="h-auto gap-1 font-mono text-[10.5px]" onClick={() => openInEditor(place.file, place.line)}>
-              <FileCode className="size-3" />{shortFile(place.file)}:{place.line}
-            </Button>
-          </Tip>
-        )}
+        {place && <PlaceLink place={place} />}
         {!c?.at && Array.isArray(places) && places.length > 1 && !c?.choices && <span>Written in {places.length} places: you choose which when you save.</span>}
         {c && <Button variant="ghost" size="sm" className="ml-auto h-5 px-1.5" onClick={() => store.revertText(node)}><Undo2 className="size-3" /> Undo</Button>}
       </div>
@@ -1038,7 +1130,7 @@ function Footer() {
             {[...store.texts.values()].map((c, i) => (
               <div key={i} className="flex items-center justify-between gap-2">
                 <span className="truncate text-[11px]">“{short(c.after, 34)}”</span>
-                <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => store.revertText(c.node)}><Undo2 className="size-3" /> Revert</Button>
+                <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => store.revertText(c.key)}><Undo2 className="size-3" /> Revert</Button>
               </div>
             ))}
           </CollapsibleContent>

@@ -20,17 +20,81 @@ export type LiveRule = {
 /** Where a text is written in the project: a file and line. */
 export type Place = { file: string; line: number };
 
-/** A pending change to a text on the page (previewed by changing the text node itself). */
+/** A source string that makes up part of a text on the page (see findPieces in core/server.ts). */
+export type Piece = Place & { text: string; start: number; end: number };
+
+/** Characters [from, to) of a text node's original text that a text change shows in. */
+export type Segment = { node: Text; from: number; to: number };
+
+/** A text change is keyed by its text node, or for a text a script split up, by its source string. */
+export type TextKey = Text | string;
+
+/** A pending change to a text on the page, previewed by changing the text nodes that show it. */
 export type TextChange = {
-  node: Text;
-  original: string; // the node's text before any change, spacing and all
-  before: string; // that text as the source would contain it (spacing collapsed)
+  key: TextKey;
+  segments: Segment[];
+  originals: string[]; // each segment's node text before any change, spacing and all
+  before: string; // the text as the source contains it (spacing collapsed)
   after: string;
-  at?: Place; // chosen when the text is written in more than one place
+  at?: Place; // where it is written, when known or chosen
   choices?: Place[]; // offered after a save found it in more than one place
 };
 
 const squash = (s: string) => s.replace(/\s+/g, " ").trim();
+const wordsOf = (s: string) => (s.trim() ? s.trim().split(/\s+/) : []);
+
+/** Show new text in a change's segments. One node: the text itself. Several (a sentence split into a
+ *  <span> per word): the new words in order, each segment keeping its number of words, any extra in
+ *  the last; spaces between segments stay as they were. */
+function previewText(c: Pick<TextChange, "segments" | "originals">, after: string) {
+  const words = wordsOf(after);
+  let w = 0;
+  c.segments.forEach((s, i) => {
+    const o = c.originals[i]!;
+    const last = i === c.segments.length - 1;
+    const n = last ? words.length - w : Math.min(wordsOf(o.slice(s.from, s.to)).length, words.length - w);
+    const part = c.segments.length === 1 ? after.trim() : words.slice(w, w + n).join(" ");
+    w += n;
+    s.node.data = o.slice(0, s.from) + part + o.slice(s.to);
+  });
+}
+const restoreText = (c: TextChange) => c.segments.forEach((s, i) => { s.node.data = c.originals[i]!; });
+
+/** An element's text as one string (spacing collapsed), with where each character comes from. */
+export type TextIndex = { full: string; at: [Text, number][] };
+
+export function textIndex(root: Element, original: (n: Text) => string = (n) => n.data): TextIndex {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (n) => (n.parentElement?.closest("script,style,noscript,template,svg") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+  });
+  let full = "";
+  const at: [Text, number][] = [];
+  let space = true;
+  while (walker.nextNode()) {
+    const n = walker.currentNode as Text;
+    const data = original(n);
+    for (let i = 0; i < data.length; i++) {
+      if (/\s/.test(data[i]!)) {
+        if (!space) { full += " "; at.push([n, i]); space = true; }
+      } else { full += data[i]; at.push([n, i]); space = false; }
+    }
+  }
+  if (full.endsWith(" ")) { full = full.slice(0, -1); at.pop(); }
+  return { full, at };
+}
+
+/** The parts of text nodes that characters [start, end) of an index come from (spaces left alone). */
+export function segmentsFor(index: TextIndex, start: number, end: number): Segment[] {
+  const out = new Map<Text, Segment>();
+  for (let k = start; k < end; k++) {
+    const [node, i] = index.at[k]!;
+    if (/\s/.test(index.full[k]!)) continue;
+    const s = out.get(node);
+    if (s) s.to = i + 1;
+    else out.set(node, { node, from: i, to: i + 1 });
+  }
+  return [...out.values()];
+}
 
 /** A style rule in a live stylesheet, before it is matched to the source. */
 type Item = { rule: CSSStyleRule; file: string | null; context: string[]; selector: string; conds: CSSRule[] };
@@ -89,8 +153,9 @@ class Store {
   files: string[] = [];
   sources = new Map<string, SourceRule>();
   edits = new Map<string, Decl[]>(); // rule key -> its declarations as edited (unsaved)
-  texts = new Map<Text, TextChange>(); // text changes (unsaved)
+  texts = new Map<TextKey, TextChange>(); // text changes (unsaved)
   places = new Map<string, Place[] | "looking">(); // where each text is written, as far as looked up
+  pieces = new Map<string, Piece[] | "looking">(); // the source strings each (split-up) text is made of
   live: LiveRule[] = [];
   selected: Element | null = null;
   hovered: Element | null = null;
@@ -195,33 +260,53 @@ class Store {
     return this.edits.size + this.texts.size;
   }
 
+  /** A node's text before any pending change. */
+  originalOf = (node: Text): string => {
+    for (const c of this.texts.values()) {
+      const i = c.segments.findIndex((s) => s.node === node);
+      if (i >= 0) return c.originals[i]!;
+    }
+    return node.data;
+  };
+
   /** Change a text on the page: shown at once, written into the source on save. */
-  setText(node: Text, after: string) {
-    const c = this.texts.get(node);
-    const original = c?.original ?? node.data;
-    const before = squash(original);
-    if (squash(after) === before) {
-      node.data = original;
-      this.texts.delete(node);
+  setText(key: TextKey, segments: Segment[], before: string, after: string, at?: Place) {
+    const c = this.texts.get(key) ?? { key, segments, originals: segments.map((s) => this.originalOf(s.node)), before: squash(before), after, at };
+    if (squash(after) === c.before) {
+      restoreText(c);
+      this.texts.delete(key);
     } else {
-      // keep the spacing around the text, which belongs to the layout
-      const lead = /^\s*/.exec(original)![0], trail = /\s*$/.exec(original)![0];
-      node.data = lead + after + trail;
-      this.texts.set(node, { ...c, node, original, before, after });
+      previewText(c, after);
+      this.texts.set(key, { ...c, after });
     }
     this.message = null;
     this.emit();
   }
-  revertText(node: Text) {
-    const c = this.texts.get(node);
-    if (c) node.data = c.original;
-    this.texts.delete(node);
+  revertText(key: TextKey) {
+    const c = this.texts.get(key);
+    if (c) restoreText(c);
+    this.texts.delete(key);
     this.emit();
   }
-  chooseTextPlace(node: Text, at: Place) {
-    const c = this.texts.get(node);
-    if (c) this.texts.set(node, { ...c, at, choices: undefined });
+  chooseTextPlace(key: TextKey, at: Place) {
+    const c = this.texts.get(key);
+    if (c) this.texts.set(key, { ...c, at, choices: undefined });
     this.message = null;
+    this.emit();
+  }
+
+  /** Look up the source strings split-up texts are made of (once each). */
+  async findPieces(texts: string[]) {
+    const todo = [...new Set(texts)].filter((t) => t && !this.pieces.has(t));
+    if (!todo.length) return;
+    for (const t of todo) this.pieces.set(t, "looking");
+    try {
+      const r = await fetch(this.endpoint, { method: "POST", headers: HEADERS, body: JSON.stringify({ pieces: todo }) });
+      const data = (await r.json()) as { pieces?: Piece[][] };
+      todo.forEach((t, i) => this.pieces.set(t, data.pieces?.[i] ?? []));
+    } catch {
+      for (const t of todo) this.pieces.delete(t);
+    }
     this.emit();
   }
 
@@ -246,7 +331,7 @@ class Store {
   }
   discardAll() {
     for (const key of [...this.edits.keys()]) this.revert(key);
-    for (const node of [...this.texts.keys()]) this.revertText(node);
+    for (const key of [...this.texts.keys()]) this.revertText(key);
   }
 
   async save() {
@@ -261,11 +346,12 @@ class Store {
     if (!r.ok) {
       // a text written in several places: offer them, then the next save uses the one chosen
       const c = r.text !== undefined ? changes.find((x) => x.before === r.text) : undefined;
-      if (c && r.hits?.length) this.texts.set(c.node, { ...c, choices: r.hits });
+      if (c && r.hits?.length) this.texts.set(c.key, { ...c, choices: r.hits });
       return this.fail(r.error);
     }
     this.texts.clear();
     this.places.clear();
+    this.pieces.clear();
     for (const [key, after] of this.edits) {
       const s = this.sources.get(key);
       if (s) this.sources.set(key, { ...s, decls: after });

@@ -13,6 +13,9 @@ of it in a production build.
   - **Text**: the element's words. Edit them in place; Save writes the new copy into the component where it
     is written (a JSX text or a `"string"`). Text that comes from data (a product name, a shop name) is
     marked as such; text written in more than one place asks which one you mean.
+  - Text a script splits up (a sentence turned into a `<span>` per word or letter for an animation, as GSAP
+    SplitText or a `Words` component does) is found as the string(s) it came from and edited whole, even
+    when you select a single word; the preview spreads the new words over the pieces.
   - **Typography**: size with −/+, a slider and common sizes (a responsive `clamp()` size is shown as
     *smallest* and *largest*), weight by name (Regular 400, Semibold 600…), line height with presets,
     letter spacing, text colour, alignment.

@@ -41,6 +41,27 @@ declare function textPattern(text: string): RegExp | null;
 declare function findTextIn(content: string, file: string, text: string): TextHit[];
 /** Replace one hit with new text, escaped for where it sits: a "string" or JSX/markup text. */
 declare function replaceText(content: string, hit: TextHit, after: string): string;
+/** A string in the source that makes up part of a text on the page; start/end are offsets in that
+ *  text with its spacing collapsed. */
+type Piece = {
+    file: string;
+    line: number;
+    text: string;
+    start: number;
+    end: number;
+};
+/** Every string literal and JSX text run in a file, as the page would show it. */
+declare function literalsIn(content: string): {
+    text: string;
+    index: number;
+}[];
+/** The source strings that, in order, make up a text the page shows: the largest cover of the text by
+ *  non-overlapping strings (so "Haali gives … fulfil." split into one <span> per word is found as the one
+ *  constant it was split from). Empty if nothing in the code makes up a real part of it. */
+declare function findPieces(files: {
+    file: string;
+    content: string;
+}[], shown: string): Piece[];
 type HandlerOptions = {
     /** The project root; file paths are relative to it. Default: process.cwd(). */
     root?: string;
@@ -62,5 +83,5 @@ declare class TextError extends EditError {
 }
 declare function createHandler(options?: HandlerOptions): (req: Request) => Promise<Response>;
 
-export { EditError, TextError, appendRule, applyRuleEdit, createHandler, cssFiles, findTextIn, projectFiles, replaceText, sourceRules, textPattern };
-export type { HandlerOptions, TextEdit, TextHit };
+export { EditError, TextError, appendRule, applyRuleEdit, createHandler, cssFiles, findPieces, findTextIn, literalsIn, projectFiles, replaceText, sourceRules, textPattern };
+export type { HandlerOptions, Piece, TextEdit, TextHit };
