@@ -47,6 +47,10 @@ of it in a production build.
   (page-wide defaults, framework styles). Properties have plain names, colours show a swatch, and a value a
   stronger style beats is marked *overridden*.
 - **Save** (<kbd>Ctrl/⌘</kbd>+<kbd>S</kbd>) writes the changes. The dev server reloads the CSS.
+- **File links** (`page.tsx:265`) open the file at that line in **your** code editor. The first time, the panel asks
+  which one: Kiro, VS Code, Cursor, Windsurf, VSCodium, Zed, any other by its link name (`trae`…), or *let the dev
+  server pick* (Next/Vite's launcher, which goes by `$EDITOR`). It is remembered in this browser; change it from the
+  start screen or with <kbd>Alt</kbd>+click on a file link. The browser asks once whether to open the editor.
 - <kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>E</kbd> opens and closes the panel.
 
 ## Install

@@ -173,6 +173,8 @@ class Store {
   pieces = new Map<string, Piece[] | "looking">(); // the source strings each (split-up) text is made of
   live: LiveRule[] = [];
   selected: Element | null = null;
+  /** Asking which code editor files open in; with the file to open once answered (file "" = just choosing). */
+  editorAsk: { file: string; line: number } | null = null;
   hovered: Element | null = null;
   highlight: string | null = null; // rule key whose elements to outline
   picking = false;

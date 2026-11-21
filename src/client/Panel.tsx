@@ -11,6 +11,7 @@ import {
   withAlpha, writtenAlpha,
 } from "../core/shared";
 import { resolveOnPage, toHex, toRgba } from "./color";
+import { cleanScheme, EDITORS, editorLabel, editorUrl, getEditor, setEditor } from "./editor";
 import { isEverywhere, modeLabel, widthCondition, widthLabel, widthOptions, type Mode, type Width } from "../core/scope";
 import { pageIsDark } from "./page";
 import { copyStyle, cssText, differences, GROUPS, pasteInto, type Copied, type Difference, type GroupId } from "./copyStyle";
@@ -186,6 +187,7 @@ export function Panel() {
           {store.selected?.isConnected ? <Inspector el={store.selected} /> : <Empty gone={!!store.selected} />}
         </div>
         <Footer />
+        <EditorChooser />
       </aside>
     </>
   );
@@ -204,6 +206,12 @@ function Empty({ gone }: { gone: boolean }) {
         <li>Changes show at once. <b className="text-foreground">Save</b> (<Kbd>{MOD} S</Kbd>) writes them into the .css file the rule lives in.</li>
         <li>Change the words too: the <b className="text-foreground">Text</b> section saves new copy into the component it is written in.</li>
         <li>Styles for other screen sizes are listed under <b className="text-foreground">All styles</b>: edit the phone layout from your desktop.</li>
+        <li>
+          File links open in <b className="text-foreground">{getEditor() ? editorLabel(getEditor()) : "the code editor you choose"}</b>.{" "}
+          <button type="button" className="text-primary underline-offset-2 hover:underline" onClick={() => { store.editorAsk = { file: "", line: 0 }; store.emit(); }}>
+            {getEditor() ? "Change" : "Choose it now"}
+          </button>
+        </li>
       </ul>
     </div>
   );
@@ -637,8 +645,8 @@ function TextBox({ k, original, onChange, disabled }: { k: TextKey; original: st
 
 function PlaceLink({ place }: { place: Place }) {
   return (
-    <Tip label="Open in your code editor">
-      <Button variant="link" size="sm" className="h-auto gap-1 font-mono text-[10.5px]" onClick={() => openInEditor(place.file, place.line)}>
+    <Tip label={`Open in ${editorLabel(getEditor())} · ${ALT}+click to choose another editor`}>
+      <Button variant="link" size="sm" className="h-auto gap-1 font-mono text-[10.5px]" onClick={(e) => openInEditor(place.file, place.line, e.altKey)}>
         <FileCode className="size-3" />{shortFile(place.file)}:{place.line}
       </Button>
     </Tip>
@@ -869,8 +877,8 @@ function RuleMeta({ m }: { m: Match }) {
       )}
       {m.state && <Badge variant="warning">{describeState(m.state)}</Badge>}
       {src && (
-        <Tip label="Open in your code editor">
-          <Button variant="link" size="sm" className="h-5 gap-1 font-mono text-[10.5px] text-muted-foreground hover:text-primary" onClick={() => openInEditor(src.file, src.line)}>
+        <Tip label={`Open in ${editorLabel(getEditor())} · ${ALT}+click to choose another editor`}>
+          <Button variant="link" size="sm" className="h-5 gap-1 font-mono text-[10.5px] text-muted-foreground hover:text-primary" onClick={(e) => openInEditor(src.file, src.line, e.altKey)}>
             <FileCode className="size-3" />{shortFile(src.file)}:{src.line}
           </Button>
         </Tip>
@@ -896,12 +904,71 @@ function countMatches(selector: string) {
   }
 }
 
-/** Ask the dev server to open a file in your code editor (Next and Vite both offer this). */
-function openInEditor(file: string, line: number) {
+/** Open a file at a line in the developer's code editor: the one they chose (asked the first time,
+ *  or again with `choose`), via its link scheme, or the dev server's launcher. */
+function openInEditor(file: string, line: number, choose = false) {
+  const choice = getEditor();
+  if (!choice || choose) {
+    store.editorAsk = { file, line };
+    store.emit();
+    return;
+  }
+  launchEditor(choice, file, line);
+}
+
+function launchEditor(choice: string, file: string, line: number) {
+  const url = editorUrl(choice, store.root ? `${store.root}/${file}` : file, line);
+  if (url) {
+    window.location.assign(url); // the browser hands it to the editor (it asks the first time)
+    return;
+  }
   const isNext = "next" in window;
   void fetch(isNext
     ? `/__nextjs_launch-editor?file=${encodeURIComponent(file)}&line1=${line}&column1=1`
     : `/__open-in-editor?file=${encodeURIComponent(`${store.root ? `${store.root}/` : ""}${file}:${line}`)}`);
+}
+
+/** "Which code editor do you use?" — shown over the panel the first time a file link is used. */
+function EditorChooser() {
+  const ask = store.editorAsk;
+  const [other, setOther] = useState("");
+  if (!ask) return null;
+  const current = getEditor();
+  const choose = (choice: string) => {
+    setEditor(choice);
+    store.editorAsk = null;
+    store.emit();
+    if (ask.file) launchEditor(choice, ask.file, ask.line);
+  };
+  const scheme = cleanScheme(other);
+  return (
+    <div className="absolute inset-0 z-10 grid place-items-center overflow-y-auto bg-background/80 p-4 backdrop-blur-sm">
+      <div role="dialog" aria-label="Choose your code editor" className="grid w-full gap-3 rounded-lg border bg-card p-4 shadow-lg">
+        <div className="grid gap-1">
+          <p className="text-[13px] font-semibold text-foreground">Which code editor do you use?</p>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Files open there, at the line. Asked once; change it any time from the start screen, or {ALT}+click a file link.
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-1.5">
+          {EDITORS.map((e) => (
+            <Button key={e.id} size="sm" variant={current === e.id ? "default" : "outline"} onClick={() => choose(e.id)}>{e.label}</Button>
+          ))}
+        </div>
+        <form className="flex gap-1.5" onSubmit={(e) => { e.preventDefault(); if (scheme) choose(`scheme:${scheme}`); }}>
+          <Input className="h-8" value={other} onChange={(e) => setOther(e.target.value)} placeholder="Another: its link name, e.g. trae" aria-label="Another editor's link name" />
+          <Button size="sm" variant="outline" type="submit" disabled={!scheme}>Use</Button>
+        </form>
+        <p className="text-[10.5px] leading-relaxed text-muted-foreground">
+          The first time, your browser asks whether to open the editor: allow it (and tick &ldquo;always&rdquo;).
+        </p>
+        <div className="flex flex-wrap justify-between gap-1">
+          <Button size="sm" variant="ghost" className="px-1.5" onClick={() => choose("server")}>Let the dev server pick</Button>
+          <Button size="sm" variant="ghost" className="px-1.5" onClick={() => { store.editorAsk = null; store.emit(); }}>Cancel</Button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ---------- box model: margin and padding, each side editable

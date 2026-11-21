@@ -1,6 +1,6 @@
 {
   "name": "domeditor",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "A development-only visual editor: point at the page, adjust type, spacing and copy, save the change into the file it came from. For Vite and Next.js.",
   "license": "UNLICENSED",
   "type": "module",
