@@ -13,17 +13,21 @@ import {
   nudge,
   numberAt,
   parseClamp,
+  parseDecls,
   readProp,
   ruleKey,
   sameDecls,
   serializeDecls,
+  sizeQueryMatches,
   specificity,
   splitTop,
   stepFor,
   weightName,
+  withAlpha,
   writeProp,
-  writeSides
-} from "../chunk-CLNWSQP6.js";
+  writeSides,
+  writtenAlpha
+} from "../chunk-QEOVT57I.js";
 import "../chunk-MLKGABMK.js";
 export {
   WEIGHT_NAMES,
@@ -40,14 +44,18 @@ export {
   nudge,
   numberAt,
   parseClamp,
+  parseDecls,
   readProp,
   ruleKey,
   sameDecls,
   serializeDecls,
+  sizeQueryMatches,
   specificity,
   splitTop,
   stepFor,
   weightName,
+  withAlpha,
   writeProp,
-  writeSides
+  writeSides,
+  writtenAlpha
 };

@@ -21,8 +21,23 @@ declare const ruleKey: (r: RuleRef) => string;
  *  Next's CSS compiler (Lightning CSS) also rewrites some selectors on the way to the browser, e.g.
  *  `.a *::before` arrives as `.a :before`, so a `*` next to a class, id, attribute or pseudo is dropped. */
 declare function normSelector(sel: string): string;
-/** An at-rule's condition (media query, supports test...) in one canonical spelling. */
+/** An at-rule's condition (media query, container query, supports test...) in one canonical spelling.
+ *  Size features are written the legacy way, because a compiler may rewrite one spelling as the other:
+ *  Next's Lightning CSS turns `@container (min-width: 720px)` into `@container (width >= 720px)`. */
 declare const normCondition: (s: string) => string;
+type SizeEnv = {
+    width: number;
+    height: number;
+    em: number;
+    rem: number;
+};
+/**
+ * Does a size query hold for a box this big? For container queries, which the browser has no
+ * `matchMedia` for. Understands width/height/inline-size/block-size as min-/max- features or ranges
+ * (`>=`, `<=`, `>`, `<`), joined by `and` or `or`, in px, em and rem. Null when the query uses
+ * anything else (a style() query, `not`, other units): the caller decides what that means.
+ */
+declare function sizeQueryMatches(query: string, env: SizeEnv): boolean | null;
 /** Split on top-level commas: "a, b:is(c, d)" -> ["a", "b:is(c, d)"]. Also splits values on spaces with splitTop(v, " "). */
 declare function splitTop(s: string, sep?: "," | " "): string[];
 type Spec = [number, number, number];
@@ -100,6 +115,18 @@ declare const composeClamp: ([a, b, c]: readonly string[]) => string;
 declare const WEIGHT_NAMES: [number, string][];
 /** 650 -> "Semibold+"; "bold" -> "Bold" */
 declare function weightName(w: string): string;
+/** "color: red; font: 500 14px/1 var(--f) !important" -> declarations (semicolons inside () or quotes kept). */
+declare function parseDecls(text: string): Decl[];
+/** How see-through a colour is *as written* (0 = clear, 1 = solid), or null when the text does not say
+ *  (a var(), a name): then read it from the computed colour. */
+declare function writtenAlpha(value: string): number | null;
+/**
+ * The same colour, `alpha` see-through (0–1; 1 = solid), keeping how it is written:
+ *   #14161a -> #14161a99 · rgb(20, 22, 26) -> rgb(20 22 26 / 60%) · oklch(…) -> oklch(… / 60%)
+ *   var(--color-bg) / white -> color-mix(in srgb, var(--color-bg) 60%, transparent)
+ * A token stays a token (so it still follows dark mode). At 1 the transparency is taken off again.
+ */
+declare function withAlpha(value: string, alpha: number): string;
 
-export { WEIGHT_NAMES, alignRules, compareSpec, composeBox, composeClamp, describeCondition, describeState, expandBox, formatNumber, normCondition, normSelector, nudge, numberAt, parseClamp, readProp, ruleKey, sameDecls, serializeDecls, specificity, splitTop, stepFor, weightName, writeProp, writeSides };
-export type { Alignment, Decl, NumberToken, RuleRef, Side, SourceRule, Spec };
+export { WEIGHT_NAMES, alignRules, compareSpec, composeBox, composeClamp, describeCondition, describeState, expandBox, formatNumber, normCondition, normSelector, nudge, numberAt, parseClamp, parseDecls, readProp, ruleKey, sameDecls, serializeDecls, sizeQueryMatches, specificity, splitTop, stepFor, weightName, withAlpha, writeProp, writeSides, writtenAlpha };
+export type { Alignment, Decl, NumberToken, RuleRef, Side, SizeEnv, SourceRule, Spec };

@@ -15,6 +15,11 @@ describe("plain words", () => {
     expect(describeCondition("(prefers-reduced-motion: no-preference)")).toBe("Animations allowed");
     expect(describeCondition("screen and (hover: hover)")).toBe("Mouse or trackpad");
     expect(describeCondition("(aspect-ratio: 16/9)")).toBe("(aspect-ratio: 16/9)");
+    // container queries are about a box on the page, not the screen
+    expect(describeCondition("@container shop (width >= 720px)")).toBe("When the “shop” container is 720px and wider");
+    expect(describeCondition("@container (width <= 200px)")).toBe("When its container is up to 200px wide");
+    expect(describeCondition("@container card (min-width: 400px) and (max-width: 700px)")).toBe("When the “card” container is 400px–700px wide");
+    expect(describeCondition("@container style(--dark: 1)")).toBe("style(--dark: 1)"); // shown as written
   });
   it("describes states", () => {
     expect(describeState(":hover")).toBe("On hover");

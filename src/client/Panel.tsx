@@ -8,8 +8,10 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactN
 import {
   composeClamp, describeCondition, describeState, nudge, parseClamp, readProp, WEIGHT_NAMES, weightName, writeProp, writeSides,
   type Decl, type Side,
+  withAlpha, writtenAlpha,
 } from "../core/shared";
-import { toHex } from "./color";
+import { resolveOnPage, toHex, toRgba } from "./color";
+import { cleanScheme, EDITORS, editorLabel, editorUrl, getEditor, setEditor } from "./editor";
 import { isEverywhere, modeLabel, widthCondition, widthLabel, widthOptions, type Mode, type Width } from "../core/scope";
 import { pageIsDark } from "./page";
 import { copyStyle, cssText, differences, GROUPS, pasteInto, type Copied, type Difference, type GroupId } from "./copyStyle";
@@ -185,6 +187,7 @@ export function Panel() {
           {store.selected?.isConnected ? <Inspector el={store.selected} /> : <Empty gone={!!store.selected} />}
         </div>
         <Footer />
+        <EditorChooser />
       </aside>
     </>
   );
@@ -203,6 +206,12 @@ function Empty({ gone }: { gone: boolean }) {
         <li>Changes show at once. <b className="text-foreground">Save</b> (<Kbd>{MOD} S</Kbd>) writes them into the .css file the rule lives in.</li>
         <li>Change the words too: the <b className="text-foreground">Text</b> section saves new copy into the component it is written in.</li>
         <li>Styles for other screen sizes are listed under <b className="text-foreground">All styles</b>: edit the phone layout from your desktop.</li>
+        <li>
+          File links open in <b className="text-foreground">{getEditor() ? editorLabel(getEditor()) : "the code editor you choose"}</b>.{" "}
+          <button type="button" className="text-primary underline-offset-2 hover:underline" onClick={() => { store.editorAsk = { file: "", line: 0 }; store.emit(); }}>
+            {getEditor() ? "Change" : "Choose it now"}
+          </button>
+        </li>
       </ul>
     </div>
   );
@@ -636,8 +645,8 @@ function TextBox({ k, original, onChange, disabled }: { k: TextKey; original: st
 
 function PlaceLink({ place }: { place: Place }) {
   return (
-    <Tip label="Open in your code editor">
-      <Button variant="link" size="sm" className="h-auto gap-1 font-mono text-[10.5px]" onClick={() => openInEditor(place.file, place.line)}>
+    <Tip label={`Open in ${editorLabel(getEditor())} · ${ALT}+click to choose another editor`}>
+      <Button variant="link" size="sm" className="h-auto gap-1 font-mono text-[10.5px]" onClick={(e) => openInEditor(place.file, place.line, e.altKey)}>
         <FileCode className="size-3" />{shortFile(place.file)}:{place.line}
       </Button>
     </Tip>
@@ -801,17 +810,37 @@ function Quick({ el, cs, cas, target, editable, inherited, wt }: QuickProps) {
           <Stepper prop="max-width" value={readProp(decls, "max-width") ?? ""} placeholder={cs.maxWidth} onChange={set("max-width")} />
         </Row>
       </Section>
+
+      <Section title="Appearance">
+        {(() => {
+          // a `background: <colour>` shorthand is edited in place; otherwise background-color
+          const bg = readProp(decls, "background");
+          const bgProp = bg && typeof CSS !== "undefined" && CSS.supports("color", bg) ? "background" : "background-color";
+          return (
+            <Row label="Fill" title={`${bgProp}: the background colour`} note={note(bgProp, "background-color")}>
+              <ColorField prop={bgProp} value={readProp(decls, bgProp)} computed={cs.backgroundColor} onChange={set(bgProp)} />
+            </Row>
+          );
+        })()}
+        <Row label="Opacity" title="opacity: how see-through the whole element is, contents included" note={note("opacity")}>
+          <Opacity value={readProp(decls, "opacity")} computed={cs.opacity} onChange={set("opacity")} />
+        </Row>
+      </Section>
     </>
   );
 }
 
 function Note({ prop, over, from }: { prop: string; over: string | null; from: { el: Element; key: string } | null }) {
   if (over) {
-    const sel = over === "inline" ? "an inline style" : store.sources.get(over)?.selector ?? "another style";
+    const live = over === "inline" ? null : store.live.find((l) => l.key === over);
+    const editable = !!live?.source;
+    const sel = over === "inline" ? "an inline style" : live?.source?.selector ?? live?.rule.selectorText ?? "another style";
+    const where = over === "inline" ? "" : editable ? " Click to edit that one instead."
+      : live?.origin === "style-tag" ? " It is written in a <style> tag in a component: change it there." : " It is not in your CSS files.";
     return (
-      <Tip label={`A stronger style sets ${prop}, so changes here will not show.${over === "inline" ? "" : " Click to edit that one instead."}`}>
+      <Tip label={`A stronger style sets ${prop}, so changes here will not show.${where}`}>
         <button type="button" className="justify-self-start truncate text-left text-[10.5px] text-warning hover:underline"
-          onClick={() => { if (over !== "inline") { store.target = over; store.emit(); } }}>
+          onClick={() => { if (editable) { store.target = over; store.emit(); } }}>
           overridden by {short(sel, 28)}
         </button>
       </Tip>
@@ -848,8 +877,8 @@ function RuleMeta({ m }: { m: Match }) {
       )}
       {m.state && <Badge variant="warning">{describeState(m.state)}</Badge>}
       {src && (
-        <Tip label="Open in your code editor">
-          <Button variant="link" size="sm" className="h-5 gap-1 font-mono text-[10.5px] text-muted-foreground hover:text-primary" onClick={() => openInEditor(src.file, src.line)}>
+        <Tip label={`Open in ${editorLabel(getEditor())} · ${ALT}+click to choose another editor`}>
+          <Button variant="link" size="sm" className="h-5 gap-1 font-mono text-[10.5px] text-muted-foreground hover:text-primary" onClick={(e) => openInEditor(src.file, src.line, e.altKey)}>
             <FileCode className="size-3" />{shortFile(src.file)}:{src.line}
           </Button>
         </Tip>
@@ -875,12 +904,71 @@ function countMatches(selector: string) {
   }
 }
 
-/** Ask the dev server to open a file in your code editor (Next and Vite both offer this). */
-function openInEditor(file: string, line: number) {
+/** Open a file at a line in the developer's code editor: the one they chose (asked the first time,
+ *  or again with `choose`), via its link scheme, or the dev server's launcher. */
+function openInEditor(file: string, line: number, choose = false) {
+  const choice = getEditor();
+  if (!choice || choose) {
+    store.editorAsk = { file, line };
+    store.emit();
+    return;
+  }
+  launchEditor(choice, file, line);
+}
+
+function launchEditor(choice: string, file: string, line: number) {
+  const url = editorUrl(choice, store.root ? `${store.root}/${file}` : file, line);
+  if (url) {
+    window.location.assign(url); // the browser hands it to the editor (it asks the first time)
+    return;
+  }
   const isNext = "next" in window;
   void fetch(isNext
     ? `/__nextjs_launch-editor?file=${encodeURIComponent(file)}&line1=${line}&column1=1`
     : `/__open-in-editor?file=${encodeURIComponent(`${store.root ? `${store.root}/` : ""}${file}:${line}`)}`);
+}
+
+/** "Which code editor do you use?" — shown over the panel the first time a file link is used. */
+function EditorChooser() {
+  const ask = store.editorAsk;
+  const [other, setOther] = useState("");
+  if (!ask) return null;
+  const current = getEditor();
+  const choose = (choice: string) => {
+    setEditor(choice);
+    store.editorAsk = null;
+    store.emit();
+    if (ask.file) launchEditor(choice, ask.file, ask.line);
+  };
+  const scheme = cleanScheme(other);
+  return (
+    <div className="absolute inset-0 z-10 grid place-items-center overflow-y-auto bg-background/80 p-4 backdrop-blur-sm">
+      <div role="dialog" aria-label="Choose your code editor" className="grid w-full gap-3 rounded-lg border bg-card p-4 shadow-lg">
+        <div className="grid gap-1">
+          <p className="text-[13px] font-semibold text-foreground">Which code editor do you use?</p>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Files open there, at the line. Asked once; change it any time from the start screen, or {ALT}+click a file link.
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-1.5">
+          {EDITORS.map((e) => (
+            <Button key={e.id} size="sm" variant={current === e.id ? "default" : "outline"} onClick={() => choose(e.id)}>{e.label}</Button>
+          ))}
+        </div>
+        <form className="flex gap-1.5" onSubmit={(e) => { e.preventDefault(); if (scheme) choose(`scheme:${scheme}`); }}>
+          <Input className="h-8" value={other} onChange={(e) => setOther(e.target.value)} placeholder="Another: its link name, e.g. trae" aria-label="Another editor's link name" />
+          <Button size="sm" variant="outline" type="submit" disabled={!scheme}>Use</Button>
+        </form>
+        <p className="text-[10.5px] leading-relaxed text-muted-foreground">
+          The first time, your browser asks whether to open the editor: allow it (and tick &ldquo;always&rdquo;).
+        </p>
+        <div className="flex flex-wrap justify-between gap-1">
+          <Button size="sm" variant="ghost" className="px-1.5" onClick={() => choose("server")}>Let the dev server pick</Button>
+          <Button size="sm" variant="ghost" className="px-1.5" onClick={() => { store.editorAsk = null; store.emit(); }}>Cancel</Button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ---------- box model: margin and padding, each side editable
@@ -1088,17 +1176,83 @@ function Stepper({ prop, value, placeholder, onChange, presets, disabled }: {
   );
 }
 
-/** A colour: swatch (opens the picker) and the value as written. */
+/** How see-through a colour is, 0–1: as written if the text says, else as the browser computed it. */
+const alphaOf = (value: string | null, computed: string) => (value ? writtenAlpha(value) : null) ?? toRgba(computed)?.[3] ?? 1;
+
+/** A colour: swatch (opens the picker), the value as written, and its opacity. */
 function ColorField({ prop, value, computed, onChange }: { prop: string; value: string | null; computed: string; onChange: (v: string | null) => void }) {
+  const alpha = alphaOf(value, computed);
   return (
     <div className="flex gap-1">
       <Tip label="Pick a colour">
-        <label className="relative size-7 shrink-0 cursor-pointer overflow-hidden rounded-md border shadow-xs" style={{ background: computed }}>
-          <input type="color" aria-label={`${prop} picker`} value={toHex(computed)} onChange={(e) => onChange(e.target.value)}
+        <label className="relative size-7 shrink-0 cursor-pointer overflow-hidden rounded-md border shadow-xs checkerboard">
+          <span className="absolute inset-0" style={{ background: computed }} />
+          <input type="color" aria-label={`${prop} picker`} value={toHex(computed)}
+            // the picker has no alpha: keep the colour's opacity
+            onChange={(e) => onChange(alpha < 0.995 ? withAlpha(e.target.value, alpha) : e.target.value)}
             className="absolute inset-0 size-full cursor-pointer opacity-0" />
         </label>
       </Tip>
       <ValueInput prop={prop} value={value ?? ""} placeholder={toHex(computed)} onChange={(v) => onChange(v)} onClear={() => onChange(null)} />
+      <AlphaInput prop={prop} alpha={alpha} onChange={(a) => onChange(withAlpha(value ?? computed, a))} />
+    </div>
+  );
+}
+
+/** A colour's opacity in %: type it, or ↑/↓ (Shift ×10). Writes the colour with transparency. */
+function AlphaInput({ prop, alpha, onChange, className }: { prop: string; alpha: number; onChange: (a: number) => void; className?: string }) {
+  const pct = Math.round(alpha * 100);
+  const [draft, setDraft] = useState(String(pct));
+  const focused = useRef(false);
+  useEffect(() => { if (!focused.current) setDraft(String(pct)); }, [pct]);
+  const commit = (n: number) => {
+    const c = Math.min(100, Math.max(0, Math.round(n)));
+    setDraft(String(c));
+    onChange(c / 100);
+  };
+  return (
+    <Tip label="Opacity of this colour: 100% is solid, 0% is clear">
+      <div className={cn("relative w-[54px] shrink-0", className)}>
+        <Input value={draft} inputMode="numeric" aria-label={`${prop} opacity`} className={cn("pr-4 text-right tabular-nums", className)}
+          onFocus={() => { focused.current = true; }}
+          onBlur={() => { focused.current = false; setDraft(String(pct)); }}
+          onChange={(e) => {
+            const v = e.target.value.replace(/[^\d.]/g, "");
+            setDraft(v);
+            if (v !== "" && !Number.isNaN(+v)) commit(+v);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+              e.preventDefault();
+              commit(pct + (e.key === "ArrowUp" ? 1 : -1) * (e.shiftKey ? 10 : 1));
+            } else if (e.key === "Enter") e.currentTarget.blur();
+          }} />
+        <span className="pointer-events-none absolute top-1/2 right-1.5 -translate-y-1/2 text-[10.5px] text-muted-foreground">%</span>
+      </div>
+    </Tip>
+  );
+}
+
+/** opacity: a slider and a number in %. Writes the way the rule already does (0.6 or 60%); new values as 0.6. */
+function Opacity({ value, computed, onChange }: { value: string | null; computed: string; onChange: (v: string | null) => void }) {
+  const read = (v: string) => (v.trim().endsWith("%") ? parseFloat(v) : parseFloat(v) * 100);
+  const declared = value !== null && !Number.isNaN(read(value)) ? read(value) : null;
+  const pct = Math.round(declared ?? (parseFloat(computed) || 1) * 100);
+  const write = (n: number) => {
+    const c = Math.min(100, Math.max(0, Math.round(n)));
+    onChange(value?.trim().endsWith("%") ? `${c}%` : String(+(c / 100).toFixed(2)));
+  };
+  return (
+    <div className="flex items-center gap-2">
+      <input type="range" min={0} max={100} step={1} value={pct} aria-label="opacity slider"
+        className={cn("h-7 min-w-0 flex-1 cursor-pointer accent-primary", declared === null && "opacity-60")}
+        onChange={(e) => write(+e.target.value)} />
+      <AlphaInput prop="opacity" alpha={pct / 100} onChange={(a) => write(a * 100)} className={declared === null ? "text-muted-foreground" : ""} />
+      {declared !== null && (
+        <Tip label="Remove opacity from this style">
+          <Button size="icon-sm" variant="ghost" aria-label="Remove opacity" className="size-5" onClick={() => onChange(null)}><X /></Button>
+        </Tip>
+      )}
     </div>
   );
 }
@@ -1155,12 +1309,16 @@ const friendly = (prop: string) => (prop.startsWith("--") ? prop : FRIENDLY[prop
 const isColorish = (prop: string, value: string) =>
   /color|^background$|^fill$|^stroke$/.test(prop) && typeof CSS !== "undefined" && CSS.supports("color", value);
 
-/** Page-wide defaults (`*`, `html`, `body`) and styles not written in a source file (Tailwind's). */
-const isBase = (m: Match) => !m.live.source || /^(\*|html|body|:root|:host)(?![\w-])/.test(m.part.trim());
+/** Page-wide defaults (`*`, `html`, `body`) and framework styles (Tailwind's). A component's own
+ *  `<style>` rules are not base styles: they are listed with the rest, read-only. */
+const isBase = (m: Match) =>
+  (!m.live.source && m.live.origin !== "style-tag") || /^(\*|html|body|:root|:host)(?![\w-])/.test(m.part.trim());
+/** Written by you (a .css file or a <style> tag), as opposed to a framework. */
+const yours = (m: Match) => !!m.live.source || m.live.origin === "style-tag";
 
 function AllStyles({ el, cas, target }: { el: Element; cas: Cascade; target: Match | null }) {
-  const states = cas.matches.filter((m) => m.state && m.live.source);
-  const screens = cas.matches.filter((m) => !m.state && !m.active && m.live.source);
+  const states = cas.matches.filter((m) => m.state && yours(m));
+  const screens = cas.matches.filter((m) => !m.state && !m.active && yours(m));
   const here = cas.matches.filter((m) => !m.state && m.active && !isBase(m));
   const base = cas.matches.filter((m) => !states.includes(m) && !screens.includes(m) && !here.includes(m));
   const card = (m: Match) => <StyleCard key={m.live.key} m={m} cas={cas} isTarget={m === target} />;
@@ -1223,12 +1381,35 @@ function StyleCard({ m, cas, isTarget }: { m: Match; cas: Cascade; isTarget: boo
         )}
       </div>
       <RuleMeta m={m} />
-      {!src ? (
+      {!src && m.live.origin === "style-tag" ? (
+        <div className="grid gap-1.5">
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Written in a <code className="font-mono">&lt;style&gt;</code> tag (a component&apos;s own styles), not in a .css file,
+            so it can&apos;t be edited here. Change it in the component, or move it into a .css file.
+          </p>
+          {decls.map((d, i) => {
+            const id = `${key}#${i}`;
+            const applied = m.state ? !cas.stateOverridden.has(id) : cas.applied.has(id) || !m.active;
+            return (
+              <div key={`${d.prop}-${i}`} className={cn("grid grid-cols-[100px_minmax(0,1fr)] items-center gap-1.5", !applied && "opacity-60")}>
+                <span className="grid min-w-0 leading-tight">
+                  <span className="truncate text-[11.5px] text-foreground">{friendly(d.prop)}</span>
+                  {!applied && <span className="text-[9.5px] text-warning">overridden</span>}
+                </span>
+                <span className="flex min-w-0 items-center gap-1.5 font-mono text-[11px] text-muted-foreground">
+                  {isColorish(d.prop, d.value) && <span className="size-3 shrink-0 rounded-full border" style={{ background: d.value }} />}
+                  <span className="truncate" title={d.value}>{d.value}{d.important ? " !important" : ""}</span>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      ) : !src ? (
         <p className="text-[11px] text-muted-foreground">Made by a framework (such as Tailwind), not written in your CSS, so it can't be edited here: <code className="font-mono break-all">{m.live.rule.style.cssText}</code></p>
       ) : (
         <div className="grid gap-1">
           {decls.map((d, i) => {
-            const applied = cas.applied.has(`${key}#${i}`) || !!m.state || !m.active;
+            const applied = m.state ? !cas.stateOverridden.has(`${key}#${i}`) : cas.applied.has(`${key}#${i}`) || !m.active;
             const swatch = isColorish(d.prop, d.value);
             return (
               <div key={`${d.prop}-${i}`} className={cn("group grid grid-cols-[100px_minmax(0,1fr)_20px] items-center gap-1.5", !applied && "opacity-60")}>
@@ -1238,11 +1419,17 @@ function StyleCard({ m, cas, isTarget }: { m: Match; cas: Cascade; isTarget: boo
                     {!applied && <span className="text-[9.5px] text-warning">overridden</span>}
                   </span>
                 </Tip>
-                <div className="relative min-w-0">
-                  {swatch && <span className="pointer-events-none absolute top-1/2 left-1.5 size-3.5 -translate-y-1/2 rounded-sm border shadow-xs" style={{ background: d.value }} />}
-                  <ValueInput prop={d.prop} value={d.value + (d.important ? " !important" : "")} className={cn("h-6", swatch && "pl-6")}
-                    onChange={(v) => set((ds) => ds.map((x, j) => (j === i ? parseDecl(d.prop, v) : x)))}
-                    onClear={() => set((ds) => ds.filter((_, j) => j !== i))} />
+                <div className="flex min-w-0 gap-1">
+                  <div className="relative min-w-0 flex-1">
+                    {swatch && <span className="checkerboard pointer-events-none absolute top-1/2 left-1.5 size-3.5 -translate-y-1/2 overflow-hidden rounded-sm border shadow-xs"><span className="absolute inset-0" style={{ background: d.value }} /></span>}
+                    <ValueInput prop={d.prop} value={d.value + (d.important ? " !important" : "")} className={cn("h-6", swatch && "pl-6")}
+                      onChange={(v) => set((ds) => ds.map((x, j) => (j === i ? parseDecl(d.prop, v) : x)))}
+                      onClear={() => set((ds) => ds.filter((_, j) => j !== i))} />
+                  </div>
+                  {swatch && (
+                    <AlphaInput prop={d.prop} className="h-6" alpha={writtenAlpha(d.value) ?? toRgba(resolveOnPage(d.value) ?? d.value)?.[3] ?? 1}
+                      onChange={(a) => set((ds) => ds.map((x, j) => (j === i ? { ...x, value: withAlpha(x.value, a) } : x)))} />
+                  )}
                 </div>
                 <Button size="icon-sm" variant="ghost" aria-label={`Remove ${d.prop}`} className="size-5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
                   onClick={() => set((ds) => ds.filter((_, j) => j !== i))}><X /></Button>

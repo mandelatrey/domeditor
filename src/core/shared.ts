@@ -29,8 +29,78 @@ export function normSelector(sel: string): string {
     .trim();
 }
 
-/** An at-rule's condition (media query, supports test...) in one canonical spelling. */
-export const normCondition = (s: string) => s.toLowerCase().replace(/["'\s]/g, "");
+/** An at-rule's condition (media query, container query, supports test...) in one canonical spelling.
+ *  Size features are written the legacy way, because a compiler may rewrite one spelling as the other:
+ *  Next's Lightning CSS turns `@container (min-width: 720px)` into `@container (width >= 720px)`. */
+export const normCondition = (s: string) => legacyRanges(s.toLowerCase().replace(/["'\s]/g, ""));
+
+const SIZE = "(width|height|inline-size|block-size|aspect-ratio)";
+const LEN = "(-?[\\d.]+[a-z%]*)";
+
+/** "(width>=720px)" -> "(min-width:720px)" (input already lower-cased, without spaces). Strict `<` / `>`
+ *  have no legacy spelling and are left as they are. */
+function legacyRanges(s: string): string {
+  return s
+    .replace(new RegExp(`\\(${LEN}<=${SIZE}<=${LEN}\\)`, "g"), "(min-$2:$1)and(max-$2:$3)")
+    .replace(new RegExp(`\\(${LEN}>=${SIZE}>=${LEN}\\)`, "g"), "(max-$2:$1)and(min-$2:$3)")
+    .replace(new RegExp(`\\(${SIZE}>=${LEN}\\)`, "g"), "(min-$1:$2)")
+    .replace(new RegExp(`\\(${SIZE}<=${LEN}\\)`, "g"), "(max-$1:$2)")
+    .replace(new RegExp(`\\(${LEN}<=${SIZE}\\)`, "g"), "(min-$2:$1)")
+    .replace(new RegExp(`\\(${LEN}>=${SIZE}\\)`, "g"), "(max-$2:$1)");
+}
+
+export type SizeEnv = { width: number; height: number; em: number; rem: number };
+
+/**
+ * Does a size query hold for a box this big? For container queries, which the browser has no
+ * `matchMedia` for. Understands width/height/inline-size/block-size as min-/max- features or ranges
+ * (`>=`, `<=`, `>`, `<`), joined by `and` or `or`, in px, em and rem. Null when the query uses
+ * anything else (a style() query, `not`, other units): the caller decides what that means.
+ */
+export function sizeQueryMatches(query: string, env: SizeEnv): boolean | null {
+  const q = normCondition(query);
+  if (!q || /not\(|style\(/.test(q)) return null;
+  const len = (v: string): number | null => {
+    const m = /^(-?[\d.]+)(px|em|rem)?$/.exec(v);
+    if (!m) return null;
+    const n = parseFloat(m[1]!);
+    if (n === 0 && !m[2]) return 0;
+    return m[2] === "px" ? n : m[2] === "em" ? n * env.em : m[2] === "rem" ? n * env.rem : null;
+  };
+  const size = (f: string) => (f === "width" || f === "inline-size" ? env.width : f === "height" || f === "block-size" ? env.height : null);
+  const feature = (part: string): boolean | null => {
+    let m = /^\((min|max)-(width|height|inline-size|block-size):([^()]+)\)$/.exec(part);
+    if (m) {
+      const v = len(m[3]!), have = size(m[2]!);
+      if (v === null || have === null) return null;
+      return m[1] === "min" ? have >= v : have <= v;
+    }
+    m = /^\((width|height|inline-size|block-size)(<|>)([^()=]+)\)$/.exec(part);
+    if (m) {
+      const v = len(m[3]!), have = size(m[1]!);
+      if (v === null || have === null) return null;
+      return m[2] === ">" ? have > v : have < v;
+    }
+    m = /^\(([^()<>=]+)(<|>)(width|height|inline-size|block-size)\)$/.exec(part);
+    if (m) {
+      const v = len(m[1]!), have = size(m[3]!);
+      if (v === null || have === null) return null;
+      return m[2] === "<" ? v < have : v > have;
+    }
+    return null;
+  };
+  let any = false;
+  for (const alt of q.split(/\)or\(/).map((a, i, all) => (i > 0 ? "(" : "") + a + (i < all.length - 1 ? ")" : ""))) {
+    let all = true;
+    for (const part of alt.split(/\)and\(/).map((a, i, xs) => (i > 0 ? "(" : "") + a + (i < xs.length - 1 ? ")" : ""))) {
+      const r = feature(part);
+      if (r === null) return null;
+      all &&= r;
+    }
+    any ||= all;
+  }
+  return any;
+}
 
 /** Split on top-level commas: "a, b:is(c, d)" -> ["a", "b:is(c, d)"]. Also splits values on spaces with splitTop(v, " "). */
 export function splitTop(s: string, sep: "," | " " = ","): string[] {
@@ -350,6 +420,16 @@ export function alignRules<T extends { selector: string; context: string[] }>(it
 
 /** A media/supports condition in plain words: "(max-width: 640px)" -> "Screens up to 640px wide". */
 export function describeCondition(text: string): string {
+  // Container queries are about the size of a box on the page, not the screen:
+  // "@container shop (width >= 720px)" -> "When the “shop” container is 720px and wider".
+  const cq = /^@container\s+(?:([a-z_-][\w-]*)\s*)?(\(.*)$/is.exec(text.trim());
+  if (cq && !/^(not|style)$/i.test(cq[1] ?? "")) {
+    const size = describeCondition(cq[2]!);
+    const phrase = /^Screens (.+?)(?: wide)?$/.exec(size);
+    if (!phrase || size.includes(",")) return text.trim();
+    const what = cq[1] ? `the “${cq[1]}” container` : "its container";
+    return `When ${what} is ${phrase[1]!.startsWith("up to") || /–/.test(phrase[1]!) ? `${phrase[1]} wide` : phrase[1]}`;
+  }
   const t = text.replace(/^@(media|supports|container)\s*/i, "").trim();
   const words: string[] = [];
   let rest = t;
@@ -417,4 +497,98 @@ export function weightName(w: string): string {
   if (exact) return exact[1];
   const below = [...WEIGHT_NAMES].reverse().find(([v]) => v < n);
   return below ? `${below[1]}+` : WEIGHT_NAMES[0]![1];
+}
+
+/** "color: red; font: 500 14px/1 var(--f) !important" -> declarations (semicolons inside () or quotes kept). */
+export function parseDecls(text: string): Decl[] {
+  const out: Decl[] = [];
+  let depth = 0, quote = "", cur = "";
+  const flush = () => {
+    const i = cur.indexOf(":");
+    if (i > 0) {
+      const prop = cur.slice(0, i).trim();
+      let value = cur.slice(i + 1).trim();
+      const important = /!\s*important\s*$/i.test(value);
+      if (important) value = value.replace(/!\s*important\s*$/i, "").trim();
+      if (prop && value) out.push({ prop, value, important });
+    }
+    cur = "";
+  };
+  for (const ch of text) {
+    if (quote) { if (ch === quote) quote = ""; }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (ch === ";" && depth === 0) { flush(); continue; }
+    cur += ch;
+  }
+  flush();
+  return out;
+}
+
+// ---------- transparency
+
+const MIX = /^color-mix\(\s*in\s+srgb\s*,\s*(.+?)\s+(-?[\d.]+)%\s*,\s*transparent\s*\)$/i;
+const HEX = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+const FN = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch)\(\s*(.*)\s*\)$/i;
+
+const pctText = (alpha: number) => `${Math.round(Math.min(1, Math.max(0, alpha)) * 100)}%`;
+const alphaNum = (a: string) => (a.trim().endsWith("%") ? parseFloat(a) / 100 : parseFloat(a));
+
+/** A colour function's channels and alpha: "20 22 26 / 60%", "20, 22, 26, 0.6" -> { channels, alpha }. */
+function fnParts(args: string): { channels: string[]; alpha: string | null } {
+  const [main, slash] = splitTop(args.replace(/\s*\/\s*/, " / "), " ").join(" ").split(" / ");
+  const channels = main!.includes(",") ? main!.split(",").map((s) => s.trim()) : splitTop(main!, " ");
+  if (slash !== undefined) return { channels, alpha: slash.trim() };
+  if (channels.length === 4) return { channels: channels.slice(0, 3), alpha: channels[3]! }; // legacy rgba(r, g, b, a)
+  return { channels, alpha: null };
+}
+
+/** How see-through a colour is *as written* (0 = clear, 1 = solid), or null when the text does not say
+ *  (a var(), a name): then read it from the computed colour. */
+export function writtenAlpha(value: string): number | null {
+  const v = value.trim();
+  const mix = MIX.exec(v);
+  if (mix) return Math.min(1, Math.max(0, parseFloat(mix[2]!) / 100));
+  const hex = HEX.exec(v);
+  if (hex) {
+    const h = hex[1]!;
+    if (h.length === 4) return parseInt(h[3]! + h[3]!, 16) / 255;
+    if (h.length === 8) return parseInt(h.slice(6), 16) / 255;
+    return 1;
+  }
+  const fn = FN.exec(v);
+  if (fn) {
+    const { alpha } = fnParts(fn[2]!);
+    return alpha === null ? 1 : Math.min(1, Math.max(0, alphaNum(alpha)));
+  }
+  if (/^transparent$/i.test(v)) return 0;
+  return null;
+}
+
+/**
+ * The same colour, `alpha` see-through (0–1; 1 = solid), keeping how it is written:
+ *   #14161a -> #14161a99 · rgb(20, 22, 26) -> rgb(20 22 26 / 60%) · oklch(…) -> oklch(… / 60%)
+ *   var(--color-bg) / white -> color-mix(in srgb, var(--color-bg) 60%, transparent)
+ * A token stays a token (so it still follows dark mode). At 1 the transparency is taken off again.
+ */
+export function withAlpha(value: string, alpha: number): string {
+  let v = value.trim();
+  const mix = MIX.exec(v);
+  if (mix) v = mix[1]!.trim();
+  const solid = alpha >= 0.995;
+  const hex = HEX.exec(v);
+  if (hex) {
+    let h = hex[1]!;
+    if (h.length <= 4) h = h.split("").map((c) => c + c).join("");
+    const rgb = h.slice(0, 6);
+    return solid ? `#${rgb}` : `#${rgb}${Math.round(Math.min(1, Math.max(0, alpha)) * 255).toString(16).padStart(2, "0")}`;
+  }
+  const fn = FN.exec(v);
+  if (fn) {
+    const name = fn[1]!.toLowerCase().replace(/a$/, "") as string; // rgba -> rgb, hsla -> hsl (same functions today)
+    const { channels } = fnParts(fn[2]!);
+    return solid ? `${name}(${channels.join(" ")})` : `${name}(${channels.join(" ")} / ${pctText(alpha)})`;
+  }
+  return solid ? v : `color-mix(in srgb, ${v} ${pctText(alpha)}, transparent)`;
 }
