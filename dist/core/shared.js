@@ -23,9 +23,11 @@ import {
   splitTop,
   stepFor,
   weightName,
+  withAlpha,
   writeProp,
-  writeSides
-} from "../chunk-7HBNJRG7.js";
+  writeSides,
+  writtenAlpha
+} from "../chunk-QEOVT57I.js";
 import "../chunk-MLKGABMK.js";
 export {
   WEIGHT_NAMES,
@@ -52,6 +54,8 @@ export {
   splitTop,
   stepFor,
   weightName,
+  withAlpha,
   writeProp,
-  writeSides
+  writeSides,
+  writtenAlpha
 };

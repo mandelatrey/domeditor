@@ -433,6 +433,57 @@ function parseDecls(text) {
   flush();
   return out;
 }
+var MIX = /^color-mix\(\s*in\s+srgb\s*,\s*(.+?)\s+(-?[\d.]+)%\s*,\s*transparent\s*\)$/i;
+var HEX = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+var FN = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch)\(\s*(.*)\s*\)$/i;
+var pctText = (alpha) => `${Math.round(Math.min(1, Math.max(0, alpha)) * 100)}%`;
+var alphaNum = (a) => a.trim().endsWith("%") ? parseFloat(a) / 100 : parseFloat(a);
+function fnParts(args) {
+  const [main, slash] = splitTop(args.replace(/\s*\/\s*/, " / "), " ").join(" ").split(" / ");
+  const channels = main.includes(",") ? main.split(",").map((s) => s.trim()) : splitTop(main, " ");
+  if (slash !== void 0) return { channels, alpha: slash.trim() };
+  if (channels.length === 4) return { channels: channels.slice(0, 3), alpha: channels[3] };
+  return { channels, alpha: null };
+}
+function writtenAlpha(value) {
+  const v = value.trim();
+  const mix = MIX.exec(v);
+  if (mix) return Math.min(1, Math.max(0, parseFloat(mix[2]) / 100));
+  const hex = HEX.exec(v);
+  if (hex) {
+    const h = hex[1];
+    if (h.length === 4) return parseInt(h[3] + h[3], 16) / 255;
+    if (h.length === 8) return parseInt(h.slice(6), 16) / 255;
+    return 1;
+  }
+  const fn = FN.exec(v);
+  if (fn) {
+    const { alpha } = fnParts(fn[2]);
+    return alpha === null ? 1 : Math.min(1, Math.max(0, alphaNum(alpha)));
+  }
+  if (/^transparent$/i.test(v)) return 0;
+  return null;
+}
+function withAlpha(value, alpha) {
+  let v = value.trim();
+  const mix = MIX.exec(v);
+  if (mix) v = mix[1].trim();
+  const solid = alpha >= 0.995;
+  const hex = HEX.exec(v);
+  if (hex) {
+    let h = hex[1];
+    if (h.length <= 4) h = h.split("").map((c) => c + c).join("");
+    const rgb = h.slice(0, 6);
+    return solid ? `#${rgb}` : `#${rgb}${Math.round(Math.min(1, Math.max(0, alpha)) * 255).toString(16).padStart(2, "0")}`;
+  }
+  const fn = FN.exec(v);
+  if (fn) {
+    const name = fn[1].toLowerCase().replace(/a$/, "");
+    const { channels } = fnParts(fn[2]);
+    return solid ? `${name}(${channels.join(" ")})` : `${name}(${channels.join(" ")} / ${pctText(alpha)})`;
+  }
+  return solid ? v : `color-mix(in srgb, ${v} ${pctText(alpha)}, transparent)`;
+}
 
 export {
   ruleKey,
@@ -460,5 +511,7 @@ export {
   composeClamp,
   WEIGHT_NAMES,
   weightName,
-  parseDecls
+  parseDecls,
+  writtenAlpha,
+  withAlpha
 };

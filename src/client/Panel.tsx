@@ -8,8 +8,9 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactN
 import {
   composeClamp, describeCondition, describeState, nudge, parseClamp, readProp, WEIGHT_NAMES, weightName, writeProp, writeSides,
   type Decl, type Side,
+  withAlpha, writtenAlpha,
 } from "../core/shared";
-import { toHex } from "./color";
+import { resolveOnPage, toHex, toRgba } from "./color";
 import { isEverywhere, modeLabel, widthCondition, widthLabel, widthOptions, type Mode, type Width } from "../core/scope";
 import { pageIsDark } from "./page";
 import { copyStyle, cssText, differences, GROUPS, pasteInto, type Copied, type Difference, type GroupId } from "./copyStyle";
@@ -801,6 +802,22 @@ function Quick({ el, cs, cas, target, editable, inherited, wt }: QuickProps) {
           <Stepper prop="max-width" value={readProp(decls, "max-width") ?? ""} placeholder={cs.maxWidth} onChange={set("max-width")} />
         </Row>
       </Section>
+
+      <Section title="Appearance">
+        {(() => {
+          // a `background: <colour>` shorthand is edited in place; otherwise background-color
+          const bg = readProp(decls, "background");
+          const bgProp = bg && typeof CSS !== "undefined" && CSS.supports("color", bg) ? "background" : "background-color";
+          return (
+            <Row label="Fill" title={`${bgProp}: the background colour`} note={note(bgProp, "background-color")}>
+              <ColorField prop={bgProp} value={readProp(decls, bgProp)} computed={cs.backgroundColor} onChange={set(bgProp)} />
+            </Row>
+          );
+        })()}
+        <Row label="Opacity" title="opacity: how see-through the whole element is, contents included" note={note("opacity")}>
+          <Opacity value={readProp(decls, "opacity")} computed={cs.opacity} onChange={set("opacity")} />
+        </Row>
+      </Section>
     </>
   );
 }
@@ -1092,17 +1109,83 @@ function Stepper({ prop, value, placeholder, onChange, presets, disabled }: {
   );
 }
 
-/** A colour: swatch (opens the picker) and the value as written. */
+/** How see-through a colour is, 0–1: as written if the text says, else as the browser computed it. */
+const alphaOf = (value: string | null, computed: string) => (value ? writtenAlpha(value) : null) ?? toRgba(computed)?.[3] ?? 1;
+
+/** A colour: swatch (opens the picker), the value as written, and its opacity. */
 function ColorField({ prop, value, computed, onChange }: { prop: string; value: string | null; computed: string; onChange: (v: string | null) => void }) {
+  const alpha = alphaOf(value, computed);
   return (
     <div className="flex gap-1">
       <Tip label="Pick a colour">
-        <label className="relative size-7 shrink-0 cursor-pointer overflow-hidden rounded-md border shadow-xs" style={{ background: computed }}>
-          <input type="color" aria-label={`${prop} picker`} value={toHex(computed)} onChange={(e) => onChange(e.target.value)}
+        <label className="relative size-7 shrink-0 cursor-pointer overflow-hidden rounded-md border shadow-xs checkerboard">
+          <span className="absolute inset-0" style={{ background: computed }} />
+          <input type="color" aria-label={`${prop} picker`} value={toHex(computed)}
+            // the picker has no alpha: keep the colour's opacity
+            onChange={(e) => onChange(alpha < 0.995 ? withAlpha(e.target.value, alpha) : e.target.value)}
             className="absolute inset-0 size-full cursor-pointer opacity-0" />
         </label>
       </Tip>
       <ValueInput prop={prop} value={value ?? ""} placeholder={toHex(computed)} onChange={(v) => onChange(v)} onClear={() => onChange(null)} />
+      <AlphaInput prop={prop} alpha={alpha} onChange={(a) => onChange(withAlpha(value ?? computed, a))} />
+    </div>
+  );
+}
+
+/** A colour's opacity in %: type it, or ↑/↓ (Shift ×10). Writes the colour with transparency. */
+function AlphaInput({ prop, alpha, onChange, className }: { prop: string; alpha: number; onChange: (a: number) => void; className?: string }) {
+  const pct = Math.round(alpha * 100);
+  const [draft, setDraft] = useState(String(pct));
+  const focused = useRef(false);
+  useEffect(() => { if (!focused.current) setDraft(String(pct)); }, [pct]);
+  const commit = (n: number) => {
+    const c = Math.min(100, Math.max(0, Math.round(n)));
+    setDraft(String(c));
+    onChange(c / 100);
+  };
+  return (
+    <Tip label="Opacity of this colour: 100% is solid, 0% is clear">
+      <div className={cn("relative w-[54px] shrink-0", className)}>
+        <Input value={draft} inputMode="numeric" aria-label={`${prop} opacity`} className={cn("pr-4 text-right tabular-nums", className)}
+          onFocus={() => { focused.current = true; }}
+          onBlur={() => { focused.current = false; setDraft(String(pct)); }}
+          onChange={(e) => {
+            const v = e.target.value.replace(/[^\d.]/g, "");
+            setDraft(v);
+            if (v !== "" && !Number.isNaN(+v)) commit(+v);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+              e.preventDefault();
+              commit(pct + (e.key === "ArrowUp" ? 1 : -1) * (e.shiftKey ? 10 : 1));
+            } else if (e.key === "Enter") e.currentTarget.blur();
+          }} />
+        <span className="pointer-events-none absolute top-1/2 right-1.5 -translate-y-1/2 text-[10.5px] text-muted-foreground">%</span>
+      </div>
+    </Tip>
+  );
+}
+
+/** opacity: a slider and a number in %. Writes the way the rule already does (0.6 or 60%); new values as 0.6. */
+function Opacity({ value, computed, onChange }: { value: string | null; computed: string; onChange: (v: string | null) => void }) {
+  const read = (v: string) => (v.trim().endsWith("%") ? parseFloat(v) : parseFloat(v) * 100);
+  const declared = value !== null && !Number.isNaN(read(value)) ? read(value) : null;
+  const pct = Math.round(declared ?? (parseFloat(computed) || 1) * 100);
+  const write = (n: number) => {
+    const c = Math.min(100, Math.max(0, Math.round(n)));
+    onChange(value?.trim().endsWith("%") ? `${c}%` : String(+(c / 100).toFixed(2)));
+  };
+  return (
+    <div className="flex items-center gap-2">
+      <input type="range" min={0} max={100} step={1} value={pct} aria-label="opacity slider"
+        className={cn("h-7 min-w-0 flex-1 cursor-pointer accent-primary", declared === null && "opacity-60")}
+        onChange={(e) => write(+e.target.value)} />
+      <AlphaInput prop="opacity" alpha={pct / 100} onChange={(a) => write(a * 100)} className={declared === null ? "text-muted-foreground" : ""} />
+      {declared !== null && (
+        <Tip label="Remove opacity from this style">
+          <Button size="icon-sm" variant="ghost" aria-label="Remove opacity" className="size-5" onClick={() => onChange(null)}><X /></Button>
+        </Tip>
+      )}
     </div>
   );
 }
@@ -1269,11 +1352,17 @@ function StyleCard({ m, cas, isTarget }: { m: Match; cas: Cascade; isTarget: boo
                     {!applied && <span className="text-[9.5px] text-warning">overridden</span>}
                   </span>
                 </Tip>
-                <div className="relative min-w-0">
-                  {swatch && <span className="pointer-events-none absolute top-1/2 left-1.5 size-3.5 -translate-y-1/2 rounded-sm border shadow-xs" style={{ background: d.value }} />}
-                  <ValueInput prop={d.prop} value={d.value + (d.important ? " !important" : "")} className={cn("h-6", swatch && "pl-6")}
-                    onChange={(v) => set((ds) => ds.map((x, j) => (j === i ? parseDecl(d.prop, v) : x)))}
-                    onClear={() => set((ds) => ds.filter((_, j) => j !== i))} />
+                <div className="flex min-w-0 gap-1">
+                  <div className="relative min-w-0 flex-1">
+                    {swatch && <span className="checkerboard pointer-events-none absolute top-1/2 left-1.5 size-3.5 -translate-y-1/2 overflow-hidden rounded-sm border shadow-xs"><span className="absolute inset-0" style={{ background: d.value }} /></span>}
+                    <ValueInput prop={d.prop} value={d.value + (d.important ? " !important" : "")} className={cn("h-6", swatch && "pl-6")}
+                      onChange={(v) => set((ds) => ds.map((x, j) => (j === i ? parseDecl(d.prop, v) : x)))}
+                      onClear={() => set((ds) => ds.filter((_, j) => j !== i))} />
+                  </div>
+                  {swatch && (
+                    <AlphaInput prop={d.prop} className="h-6" alpha={writtenAlpha(d.value) ?? toRgba(resolveOnPage(d.value) ?? d.value)?.[3] ?? 1}
+                      onChange={(a) => set((ds) => ds.map((x, j) => (j === i ? { ...x, value: withAlpha(x.value, a) } : x)))} />
+                  )}
                 </div>
                 <Button size="icon-sm" variant="ghost" aria-label={`Remove ${d.prop}`} className="size-5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
                   onClick={() => set((ds) => ds.filter((_, j) => j !== i))}><X /></Button>

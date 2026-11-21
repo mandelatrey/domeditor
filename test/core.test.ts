@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendRule, applyRuleEdit, createHandler, cssFiles, EditError, sourceRules } from "../src/core/server";
-import { alignRules, composeBox, expandBox, normCondition, normSelector, nudge, parseDecls, readProp, sizeQueryMatches, specificity, writeProp, writeSides, type Decl } from "../src/core/shared";
+import { alignRules, composeBox, expandBox, normCondition, normSelector, nudge, parseDecls, withAlpha, writtenAlpha, readProp, sizeQueryMatches, specificity, writeProp, writeSides, type Decl } from "../src/core/shared";
 
 const d = (prop: string, value: string): Decl => ({ prop, value, important: false });
 
@@ -47,6 +47,29 @@ describe("domeditor: matching the browser's rules to the source", () => {
       { prop: "background", value: 'url("a;b.png")', important: true }, d("content", '";"'),
     ]);
     expect(parseDecls("")).toEqual([]);
+  });
+  it("makes a colour see-through, keeping how it is written", () => {
+    expect(withAlpha("var(--color-bg)", 0.6)).toBe("color-mix(in srgb, var(--color-bg) 60%, transparent)");
+    expect(withAlpha("color-mix(in srgb, var(--color-bg) 60%, transparent)", 0.25)).toBe("color-mix(in srgb, var(--color-bg) 25%, transparent)");
+    expect(withAlpha("color-mix(in srgb, var(--color-bg) 60%, transparent)", 1)).toBe("var(--color-bg)");
+    expect(withAlpha("#14161a", 0.6)).toBe("#14161a99");
+    expect(withAlpha("#fff", 0.5)).toBe("#ffffff80");
+    expect(withAlpha("#14161a99", 1)).toBe("#14161a");
+    expect(withAlpha("rgb(20, 22, 26)", 0.6)).toBe("rgb(20 22 26 / 60%)");
+    expect(withAlpha("rgba(20, 22, 26, 0.6)", 0.3)).toBe("rgb(20 22 26 / 30%)");
+    expect(withAlpha("rgb(16 18 22 / 0.35)", 1)).toBe("rgb(16 18 22)");
+    expect(withAlpha("oklch(0.7 0.1 40)", 0.5)).toBe("oklch(0.7 0.1 40 / 50%)");
+    expect(withAlpha("white", 0.9)).toBe("color-mix(in srgb, white 90%, transparent)");
+  });
+  it("reads how see-through a colour is written", () => {
+    expect(writtenAlpha("color-mix(in srgb, var(--color-panel) 92%, transparent)")).toBe(0.92);
+    expect(writtenAlpha("#14161a99")).toBeCloseTo(0.6, 2);
+    expect(writtenAlpha("#14161a")).toBe(1);
+    expect(writtenAlpha("rgb(16 18 22 / 0.35)")).toBe(0.35);
+    expect(writtenAlpha("rgba(16, 18, 22, 40%)")).toBe(0.4);
+    expect(writtenAlpha("rgb(16 18 22)")).toBe(1);
+    expect(writtenAlpha("var(--color-bg)")).toBe(null);
+    expect(writtenAlpha("transparent")).toBe(0);
   });
   it("evaluates a container size query", () => {
     const env = { width: 1132, height: 400, em: 16, rem: 16 };

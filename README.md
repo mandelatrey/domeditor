@@ -20,6 +20,11 @@ of it in a production build.
     *smallest* and *largest*), weight by name (Regular 400, Semibold 600…), line height with presets,
     letter spacing, text colour, alignment.
   - **Spacing** (a box model for margin and padding, and gaps), **layout** (flex/grid alignment) and **size**.
+  - **Appearance**: the fill (background colour) and the element's **opacity** (a slider and a %).
+  - Every colour, here and under *All styles*, has an **opacity %** next to it (<kbd>↑</kbd>/<kbd>↓</kbd>, <kbd>Shift</kbd> ×10).
+    It keeps how the colour is written: `#14161a` → `#14161a99`, `rgb(20 22 26)` → `rgb(20 22 26 / 60%)`, and a
+    token stays a token, `var(--color-bg)` → `color-mix(in srgb, var(--color-bg) 60%, transparent)`, so it still
+    follows dark mode. Back at 100% the transparency is taken off again. The colour picker keeps the opacity.
   - Type values, use −/+, or <kbd>↑</kbd>/<kbd>↓</kbd> on any number (<kbd>Shift</kbd> ×10, <kbd>Alt</kbd> ×0.1).
     Shorthands are edited in place (`padding: 18px 20px` stays one line; `font: 650 clamp(…)/1.04 …` keeps its shape).
 - **Copy style** (the copy icon next to the element's name) takes the selected element's look: what you see,
