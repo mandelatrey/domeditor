@@ -61,6 +61,11 @@ npm 12 and later refuse git dependencies unless a project allows them. If `npm i
 add `--allow-git=root` (allows only git dependencies listed in your own `package.json`), or put
 `allow-git=root` in the project's `.npmrc` so every install, including CI, gets it.
 
+`root` checks the git dependencies the *lockfile* records for the project, not `package.json`. So after you change
+domeditor's address (to a branch such as `github:mandelatrey/domeditor#some-branch`, or back), `root` refuses it
+(`EALLOWGIT … Refusing to fetch`) until the lockfile has been rewritten once. Run that one install with
+`--allow-git=all`; later installs work with `root` again.
+
 ### Vite
 
 ```ts
