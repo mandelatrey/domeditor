@@ -29,6 +29,14 @@ of it in a production build.
   style chosen under *Changes apply to*, using the source's own values where it has them (`var(--token)`,
   `rem`, `clamp()`), as shorthands where every side matches. What a stronger style keeps is reported. The
   look is also put on the system clipboard as CSS.
+- **When** (under *Changes apply to*): make edits apply only in **dark mode** or **light mode**, and/or only
+  at a **screen size** (the project's own breakpoints that apply at the window's current width: "Up to 640px",
+  "720px and up"). The edits go into a scoped copy of the style, written the way the project already writes
+  dark mode: in a `prefers-color-scheme` media query (with its selector prefix, e.g.
+  `:root:not([data-theme=light])`), with its theme attribute or class (`[data-theme=dark] .x`, `.dark .x`), or
+  both when the project switches dark mode by the system setting *and* a theme switch. A scoped style that
+  already exists is edited; otherwise it is previewed and created on Save. The panel's header shows the scope,
+  and warns when the page is not showing it (light mode, another width).
 - **All styles** tab: every style that applies to the element, grouped as *on this element*, *other screen
   sizes* ("Screens up to 640px wide"), *hover, focus and other states*, and collapsed *base styles*
   (page-wide defaults, framework styles). Properties have plain names, colours show a swatch, and a value a

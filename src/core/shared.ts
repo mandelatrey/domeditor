@@ -22,7 +22,10 @@ export function normSelector(sel: string): string {
     .replace(/\(\s*even\s*\)/gi, "(2n)")
     .replace(/(^|[^:]):(before|after|first-line|first-letter)\b/gi, "$1::$2")
     .replace(/\s+/g, " ")
-    .replace(/\s*([>+~,()])\s*/g, "$1")
+    .replace(/\s*([>+~,])\s*/g, "$1")
+    // inside parentheses spaces do not matter; after ")" a space is the descendant combinator, so it stays
+    .replace(/\(\s+/g, "(")
+    .replace(/\s+\)/g, ")")
     .trim();
 }
 

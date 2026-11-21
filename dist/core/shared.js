@@ -23,7 +23,7 @@ import {
   weightName,
   writeProp,
   writeSides
-} from "../chunk-JU27U4TM.js";
+} from "../chunk-CLNWSQP6.js";
 import "../chunk-MLKGABMK.js";
 export {
   WEIGHT_NAMES,

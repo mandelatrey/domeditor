@@ -2,8 +2,8 @@
 // page's CSS and the panel's never meet. The framework adapters call it; call it yourself elsewhere.
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { toRgba } from "./color";
 import { store } from "./model";
+import { pageIsDark, systemDark } from "./page";
 import { Panel, setHost } from "./Panel";
 import { PortalContainer } from "./ui/portal";
 import { TooltipProvider } from "./ui/tooltip";
@@ -83,7 +83,7 @@ function watchStylesheets() {
     timer = window.setTimeout(() => void store.load(), 120);
   };
   const isSheet = (n: Node | null): boolean =>
-    n instanceof HTMLLinkElement ? n.rel === "stylesheet" : n instanceof HTMLStyleElement;
+    n instanceof HTMLLinkElement ? n.rel === "stylesheet" : n instanceof HTMLStyleElement && !n.hasAttribute("data-domeditor-preview");
   new MutationObserver((records) => {
     let changed = false;
     for (const r of records) {
@@ -100,21 +100,4 @@ function watchStylesheets() {
     }
     if (changed) reload();
   }).observe(document.head, { childList: true, subtree: true, characterData: true });
-}
-
-const systemDark = () => matchMedia("(prefers-color-scheme: dark)").matches;
-
-/** Whether the page is showing its dark theme: an explicit data-theme / class on <html> or <body>,
- *  else how dark its background is, else the system setting. */
-function pageIsDark(): boolean {
-  for (const el of [document.documentElement, document.body]) {
-    const said = `${el.getAttribute("data-theme") ?? ""} ${el.getAttribute("data-mode") ?? ""} ${el.getAttribute("data-color-scheme") ?? ""}`.toLowerCase();
-    if (/\bdark\b/.test(said) || el.classList.contains("dark")) return true;
-    if (/\blight\b/.test(said) || el.classList.contains("light")) return false;
-  }
-  for (const el of [document.body, document.documentElement]) {
-    const rgba = toRgba(getComputedStyle(el).backgroundColor);
-    if (rgba && rgba[3] > 0.5) return 0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2] < 128;
-  }
-  return systemDark();
 }

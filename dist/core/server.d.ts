@@ -17,8 +17,10 @@ declare function applyRuleEdit(css: string, edit: {
     before: Decl[];
     after: Decl[];
 }): string;
-/** Add a new rule at the end of a stylesheet, written one-line or multi-line to match most of the file's rules. */
-declare function appendRule(css: string, selector: string, decls: Decl[]): string;
+/** Add a new rule at the end of a stylesheet, written one-line or multi-line to match most of the file's
+ *  rules. With `media`, inside `@media <media> { }`: the file's last block if it has that condition, else a
+ *  new one. */
+declare function appendRule(css: string, selector: string, decls: Decl[], media?: string | null): string;
 /** Where a piece of text a page shows is written in a source file. */
 type TextHit = {
     file: string;

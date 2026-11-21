@@ -15,6 +15,9 @@ describe("domeditor: matching the browser's rules to the source", () => {
     expect(normSelector(".fact:nth-child(n + 4)")).toBe(normSelector(".fact:nth-child(n+4)"));
     expect(normSelector(".fact:nth-child(odd)")).toBe(normSelector(".fact:nth-child(2n + 1)"));
     expect(normSelector(".a .b")).not.toBe(normSelector(".a.b"));
+    expect(normSelector(':root:not([data-theme="light"]) .logo')).toBe(":root:not([data-theme=light]) .logo");
+    expect(normSelector(":is(.a, .b) p")).not.toBe(normSelector(":is(.a,.b)p"));
+    expect(normSelector(":not( .x )")).toBe(":not(.x)");
     // Next's CSS compiler drops a `*` that sits next to a pseudo-element
     expect(normSelector(".lp *::before")).toBe(normSelector(".lp ::before"));
     expect(normSelector("*, *::before, *::after")).toBe(normSelector("*, ::before, ::after"));

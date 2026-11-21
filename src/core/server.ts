@@ -86,23 +86,36 @@ export function applyRuleEdit(css: string, edit: { ref: RuleRef; before: Decl[];
   return root.toString();
 }
 
-/** Add a new rule at the end of a stylesheet, written one-line or multi-line to match most of the file's rules. */
-export function appendRule(css: string, selector: string, decls: Decl[]): string {
+/** Add a new rule at the end of a stylesheet, written one-line or multi-line to match most of the file's
+ *  rules. With `media`, inside `@media <media> { }`: the file's last block if it has that condition, else a
+ *  new one. */
+export function appendRule(css: string, selector: string, decls: Decl[], media: string | null = null): string {
   if (!selector.trim() || /[{}]/.test(selector)) throw new EditError("not a valid selector");
+  if (media !== null && (!media.trim() || /[{};]/.test(media))) throw new EditError("not a valid media condition");
   try {
     postcss.parse(`${selector} {}`);
   } catch {
     throw new EditError("not a valid selector");
   }
+  const root = postcss.parse(css);
   let multi = 0, one = 0;
-  postcss.parse(css).walkRules((r) => { if (/\n/.test(r.toString())) multi++; else one++; });
+  root.walkRules((r) => { if (/\n/.test(r.toString())) multi++; else one++; });
   const text = (d: Decl) => `${d.prop}: ${d.value}${d.important ? " !important" : ""};`;
+  const indent = media ? "  " : "";
   const body = multi > one
-    ? `\n${decls.map((d) => `  ${text(d)}\n`).join("")}`
+    ? `\n${decls.map((d) => `${indent}  ${text(d)}\n`).join("")}${indent}`
     : decls.length ? ` ${decls.map(text).join(" ")} ` : " ";
-  return `${css.replace(/\s*$/, "\n")}${selector.trim()} {${body}}\n`;
+  const rule = `${indent}${selector.trim()} {${body}}`;
+  if (!media) return `${css.replace(/\s*$/, "\n")}${rule}\n`;
+  const last = root.last;
+  if (last?.type === "atrule" && (last as AtRule).name === "media" && normCondition((last as AtRule).params) === normCondition(media)) {
+    const block = last as AtRule;
+    const end = block.source?.end?.offset;
+    const close = end === undefined ? -1 : css.lastIndexOf("}", end);
+    if (close >= 0) return css.slice(0, close).replace(/\s*$/, "\n") + rule + "\n" + css.slice(close);
+  }
+  return `${css.replace(/\s*$/, "\n")}@media ${media.trim()} {\n${rule}\n}\n`;
 }
-
 // ---------- text: copy written in the project's components
 
 /** Where a piece of text a page shows is written in a source file. */
@@ -266,6 +279,8 @@ export function projectFiles(root: string, include: string[] = ["."], exclude: s
 type SaveRequest = {
   edits?: { ref: RuleRef; before: Decl[]; after: Decl[] }[];
   create?: { file: string; selector: string; decls: Decl[] };
+  /** new rules for scoped edits (dark mode only, a screen size), each optionally inside @media */
+  creates?: { file: string; media: string | null; selector: string; decls: Decl[] }[];
   /** text changes: the text as the page showed it, the new text, and (when it is written in more than one place) which */
   texts?: TextEdit[];
   /** look up where texts are written, without changing anything */
@@ -307,7 +322,7 @@ export function createHandler(options: HandlerOptions = {}): (req: Request) => P
       if (req.method === "POST") {
         const text = await req.text();
         if (text.length > 1_000_000) throw new EditError("request too large");
-        const { edits = [], create, texts = [], find, pieces } = JSON.parse(text) as SaveRequest;
+        const { edits = [], create, creates = [], texts = [], find, pieces } = JSON.parse(text) as SaveRequest;
         const sources = () => projectFiles(root, options.include, options.exclude, TEXT_EXT);
         const lookup = (t: string, read: (f: string) => string) =>
           sources().flatMap((f) => {
@@ -330,6 +345,7 @@ export function createHandler(options: HandlerOptions = {}): (req: Request) => P
         };
         for (const e of edits) byFile.set(e.ref.file, applyRuleEdit(current(e.ref.file), e));
         if (create) byFile.set(create.file, appendRule(current(create.file), create.selector, create.decls));
+        for (const c of creates) byFile.set(c.file, appendRule(current(c.file), c.selector, c.decls, c.media));
         if (texts.length) {
           const editable = new Set(sources());
           const now = (f: string) => byFile.get(f) ?? read(f);

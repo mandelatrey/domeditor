@@ -4,6 +4,7 @@ import {
   alignRules, compareSpec, normCondition, normSelector, ruleKey, sameDecls, serializeDecls, specificity, splitTop,
   type Decl, type RuleRef, type SourceRule, type Spec,
 } from "../core/shared";
+import { EVERYWHERE, modePattern, scopedContext, scopedRules, type ModePattern, type Scope, type ScopedRule } from "../core/scope";
 
 const HEADERS = { "x-domeditor": "1", "Content-Type": "application/json" };
 
@@ -96,6 +97,10 @@ export function segmentsFor(index: TextIndex, start: number, end: number): Segme
   return [...out.values()];
 }
 
+/** A scoped rule not written yet: where it will go, and its declarations. */
+export type VirtualRule = ScopedRule & { file: string; decls: Decl[] };
+const virtualKey = (file: string, r: ScopedRule) => JSON.stringify([file, r.media, normSelector(r.selector)]);
+
 /** A style rule in a live stylesheet, before it is matched to the source. */
 type Item = { rule: CSSStyleRule; file: string | null; context: string[]; selector: string; conds: CSSRule[] };
 
@@ -154,6 +159,11 @@ class Store {
   sources = new Map<string, SourceRule>();
   edits = new Map<string, Decl[]>(); // rule key -> its declarations as edited (unsaved)
   texts = new Map<TextKey, TextChange>(); // text changes (unsaved)
+  scope: Scope = EVERYWHERE; // where edits apply: every mode and size, or only dark mode, a screen size...
+  virtuals = new Map<string, VirtualRule>(); // scoped rules not written yet: previewed, created on save
+  private previewEl: HTMLStyleElement | null = null;
+  private previewUntilLoad = false;
+  private pattern: ModePattern | null = null;
   places = new Map<string, Place[] | "looking">(); // where each text is written, as far as looked up
   pieces = new Map<string, Piece[] | "looking">(); // the source strings each (split-up) text is made of
   live: LiveRule[] = [];
@@ -191,6 +201,11 @@ class Store {
       this.message = { kind: "error", text: `Could not read the stylesheets: ${(e as Error).message}` };
     }
     await this.reindex();
+    if (this.previewUntilLoad && !this.virtuals.size) {
+      this.previewUntilLoad = false;
+      this.renderPreview();
+    }
+    this.pattern = null;
     this.emit();
   }
 
@@ -207,6 +222,7 @@ class Store {
       out.push({ key: source ? ruleKey(source) : `live:${unknown++}`, ref, rule: r.rule, order: order++, conds: r.conds, source });
     };
     for (const { sheet, fileOf } of sheets) {
+      if ((sheet.ownerNode as Element | null)?.hasAttribute?.("data-domeditor-preview")) continue;
       const items = styleRules(sheet, fileOf);
       if (fileOf) {
         // Vite or Turbopack said which file each rule came from: line them up with that file's source, in order
@@ -257,7 +273,57 @@ class Store {
 
   /** How many changes are waiting to be saved. */
   get pending() {
-    return this.edits.size + this.texts.size;
+    return this.edits.size + this.texts.size + this.virtuals.size;
+  }
+
+  /** How the project writes dark mode (learnt from its CSS once per load). */
+  modePattern(): ModePattern {
+    this.pattern ??= modePattern([...this.sources.values()]);
+    return this.pattern;
+  }
+
+  /** Where an edit to a rule goes in the current scope: the rule itself, or the scoped rule(s) for it,
+   *  each one already written (key) or not yet (virtual). */
+  scopedTargets(base: SourceRule): { rule: ScopedRule; file: string; key: string | null }[] {
+    return scopedRules(base.selector, this.scope, this.modePattern()).map((rule) => {
+      const context = JSON.stringify(scopedContext(rule));
+      const selector = normSelector(rule.selector);
+      const found = (this.byFile.get(base.file) ?? []).find((s) => s.selector === selector && JSON.stringify(s.context) === context)
+        ?? [...this.sources.values()].find((s) => s.selector === selector && JSON.stringify(s.context) === context);
+      return { rule, file: found?.file ?? base.file, key: found ? ruleKey(found) : null };
+    });
+  }
+
+  virtualDecls(file: string, rule: ScopedRule): Decl[] {
+    return this.virtuals.get(virtualKey(file, rule))?.decls ?? [];
+  }
+  /** Change a scoped rule that is not written yet: previewed at once, created on save. */
+  setVirtual(file: string, rule: ScopedRule, decls: Decl[]) {
+    const k = virtualKey(file, rule);
+    if (decls.length) this.virtuals.set(k, { file, ...rule, decls });
+    else this.virtuals.delete(k);
+    this.renderPreview();
+    this.message = null;
+    this.emit();
+  }
+  /** The preview of not-yet-written rules: a stylesheet of the editor's own, last in <head> so it wins
+   *  over rules of equal weight (the observer and the indexing leave it alone). */
+  private renderPreview() {
+    const css = [...this.virtuals.values()].map((v) => {
+      const rule = `${v.selector} { ${serializeDecls(v.decls)} }`;
+      return v.media ? `@media ${v.media} { ${rule} }` : rule;
+    }).join("\n");
+    if (!css) {
+      this.previewEl?.remove();
+      this.previewEl = null;
+      return;
+    }
+    if (!this.previewEl) {
+      this.previewEl = document.createElement("style");
+      this.previewEl.setAttribute("data-domeditor-preview", "");
+    }
+    this.previewEl.textContent = css;
+    document.head.appendChild(this.previewEl);
   }
 
   /** A node's text before any pending change. */
@@ -332,6 +398,9 @@ class Store {
   discardAll() {
     for (const key of [...this.edits.keys()]) this.revert(key);
     for (const key of [...this.texts.keys()]) this.revertText(key);
+    this.virtuals.clear();
+    this.renderPreview();
+    this.emit();
   }
 
   async save() {
@@ -342,7 +411,8 @@ class Store {
     });
     const changes = [...this.texts.values()];
     const texts = changes.map((c) => ({ before: c.before, after: squash(c.after), at: c.at }));
-    const r = await this.post({ edits, texts });
+    const creates = [...this.virtuals.values()].map(({ file, media, selector, decls }) => ({ file, media, selector, decls }));
+    const r = await this.post({ edits, texts, creates });
     if (!r.ok) {
       // a text written in several places: offer them, then the next save uses the one chosen
       const c = r.text !== undefined ? changes.find((x) => x.before === r.text) : undefined;
@@ -357,6 +427,12 @@ class Store {
       if (s) this.sources.set(key, { ...s, decls: after });
     }
     this.edits.clear();
+    if (this.virtuals.size) {
+      // the new rules arrive with the rebuilt stylesheet; keep the preview until then
+      this.virtuals.clear();
+      this.previewUntilLoad = true;
+      setTimeout(() => this.renderPreview(), 6000);
+    }
     this.message = { kind: "ok", text: `Saved to ${r.files.map(shortFile).join(", ")}` };
     this.emit();
     // Next rebuilds the CSS and swaps it in; check it did, in case the browser kept an old copy

@@ -1,7 +1,7 @@
 // src/core/shared.ts
 var ruleKey = (r) => JSON.stringify([r.file, r.context, r.selector, r.occurrence]);
 function normSelector(sel) {
-  return sel.replace(/["']/g, "").replace(/\*(?=[.#:[])/g, "").replace(/\(\s*odd\s*\)/gi, "(2n+1)").replace(/\(\s*even\s*\)/gi, "(2n)").replace(/(^|[^:]):(before|after|first-line|first-letter)\b/gi, "$1::$2").replace(/\s+/g, " ").replace(/\s*([>+~,()])\s*/g, "$1").trim();
+  return sel.replace(/["']/g, "").replace(/\*(?=[.#:[])/g, "").replace(/\(\s*odd\s*\)/gi, "(2n+1)").replace(/\(\s*even\s*\)/gi, "(2n)").replace(/(^|[^:]):(before|after|first-line|first-letter)\b/gi, "$1::$2").replace(/\s+/g, " ").replace(/\s*([>+~,])\s*/g, "$1").replace(/\(\s+/g, "(").replace(/\s+\)/g, ")").trim();
 }
 var normCondition = (s) => s.toLowerCase().replace(/["'\s]/g, "");
 function splitTop(s, sep = ",") {

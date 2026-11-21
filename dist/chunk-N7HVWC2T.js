@@ -2,7 +2,7 @@ import {
   normCondition,
   normSelector,
   sameDecls
-} from "./chunk-JU27U4TM.js";
+} from "./chunk-CLNWSQP6.js";
 
 // src/core/server.ts
 import { readdirSync, readFileSync, writeFileSync } from "fs";
@@ -78,23 +78,38 @@ function applyRuleEdit(css, edit) {
   patchRule(hit.rule, edit.after);
   return root.toString();
 }
-function appendRule(css, selector, decls) {
+function appendRule(css, selector, decls, media = null) {
   if (!selector.trim() || /[{}]/.test(selector)) throw new EditError("not a valid selector");
+  if (media !== null && (!media.trim() || /[{};]/.test(media))) throw new EditError("not a valid media condition");
   try {
     postcss.parse(`${selector} {}`);
   } catch {
     throw new EditError("not a valid selector");
   }
+  const root = postcss.parse(css);
   let multi = 0, one = 0;
-  postcss.parse(css).walkRules((r) => {
+  root.walkRules((r) => {
     if (/\n/.test(r.toString())) multi++;
     else one++;
   });
   const text = (d) => `${d.prop}: ${d.value}${d.important ? " !important" : ""};`;
+  const indent = media ? "  " : "";
   const body = multi > one ? `
-${decls.map((d) => `  ${text(d)}
-`).join("")}` : decls.length ? ` ${decls.map(text).join(" ")} ` : " ";
-  return `${css.replace(/\s*$/, "\n")}${selector.trim()} {${body}}
+${decls.map((d) => `${indent}  ${text(d)}
+`).join("")}${indent}` : decls.length ? ` ${decls.map(text).join(" ")} ` : " ";
+  const rule = `${indent}${selector.trim()} {${body}}`;
+  if (!media) return `${css.replace(/\s*$/, "\n")}${rule}
+`;
+  const last = root.last;
+  if (last?.type === "atrule" && last.name === "media" && normCondition(last.params) === normCondition(media)) {
+    const block = last;
+    const end = block.source?.end?.offset;
+    const close = end === void 0 ? -1 : css.lastIndexOf("}", end);
+    if (close >= 0) return css.slice(0, close).replace(/\s*$/, "\n") + rule + "\n" + css.slice(close);
+  }
+  return `${css.replace(/\s*$/, "\n")}@media ${media.trim()} {
+${rule}
+}
 `;
 }
 var TEXT_EXT = /\.(tsx|jsx|ts|js|mjs|mdx|md|html|vue|svelte|astro)$/;
@@ -239,7 +254,7 @@ function createHandler(options = {}) {
       if (req.method === "POST") {
         const text = await req.text();
         if (text.length > 1e6) throw new EditError("request too large");
-        const { edits = [], create, texts = [], find, pieces } = JSON.parse(text);
+        const { edits = [], create, creates = [], texts = [], find, pieces } = JSON.parse(text);
         const sources = () => projectFiles(root, options.include, options.exclude, TEXT_EXT);
         const lookup = (t, read2) => sources().flatMap((f) => {
           const c = read2(f);
@@ -261,6 +276,7 @@ function createHandler(options = {}) {
         };
         for (const e of edits) byFile.set(e.ref.file, applyRuleEdit(current(e.ref.file), e));
         if (create) byFile.set(create.file, appendRule(current(create.file), create.selector, create.decls));
+        for (const c of creates) byFile.set(c.file, appendRule(current(c.file), c.selector, c.decls, c.media));
         if (texts.length) {
           const editable = new Set(sources());
           const now = (f) => byFile.get(f) ?? read(f);

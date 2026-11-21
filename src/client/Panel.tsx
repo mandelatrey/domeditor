@@ -10,6 +10,8 @@ import {
   type Decl, type Side,
 } from "../core/shared";
 import { toHex } from "./color";
+import { isEverywhere, modeLabel, widthCondition, widthLabel, widthOptions, type Mode, type Width } from "../core/scope";
+import { pageIsDark } from "./page";
 import { copyStyle, cssText, differences, GROUPS, pasteInto, type Copied, type Difference, type GroupId } from "./copyStyle";
 import {
   cascade, conditionLabel, defaultTarget, inheritedFrom, label, segmentsFor, shortFile, store, suggestSelector, textIndex,
@@ -158,6 +160,11 @@ export function Panel() {
           <Tip label="Viewport width: @media rules depend on it">
             <Badge variant="outline" className="font-mono">{window.innerWidth}px</Badge>
           </Tip>
+          {!isEverywhere(store.scope) && (
+            <Tip label="Edits apply only here. Change it under Design → When.">
+              <Badge variant="warning" className="max-w-28 truncate">{[store.scope.mode === "all" ? "" : store.scope.mode === "dark" ? "Dark" : "Light", store.scope.width ? `${store.scope.width.kind === "max" ? "≤" : "≥"}${store.scope.width.px}px` : ""].filter(Boolean).join(" · ")}</Badge>
+            </Tip>
+          )}
           <span className="flex-1" />
           <Tip label={<>Pick an element. Or {ALT}+click anything, any time. <Kbd>Esc</Kbd> stops.</>}>
             <Button size="sm" variant={store.picking ? "default" : "outline"} aria-pressed={store.picking}
@@ -211,6 +218,7 @@ function Inspector({ el }: { el: Element }) {
   const inherited = useMemo(() => inheritedFrom(el, TEXT_PROPS), [el, version]);
   const editable = cas.matches.filter((m) => !m.state && m.live.source);
   const target = (store.target && editable.find((m) => m.live.key === store.target)) || defaultTarget(el, cas.matches);
+  const wt = writeTarget(target);
   const [tab, setTab] = useState(() => readLocal(TAB_KEY, "design"));
   const cs = getComputedStyle(el);
   const r = el.getBoundingClientRect();
@@ -267,9 +275,9 @@ function Inspector({ el }: { el: Element }) {
           </TabsList>
         </div>
         <TabsContent value="design">
-          {clipboard && clipboard.from !== el && <PasteStyle key={nodeId(el)} el={el} target={target} />}
+          {clipboard && clipboard.from !== el && <PasteStyle key={nodeId(el)} el={el} target={target} wt={wt} />}
           <TextSection el={el} />
-          <Quick el={el} cs={cs} cas={cas} target={target} editable={editable} inherited={inherited} />
+          <Quick el={el} cs={cs} cas={cas} target={target} editable={editable} inherited={inherited} wt={wt} />
         </TabsContent>
         <TabsContent value="rules">
           <AllStyles el={el} cas={cas} target={target} />
@@ -304,6 +312,88 @@ function Row({ label, title, note, children }: { label: string; title?: string; 
     <div className="grid grid-cols-[60px_minmax(0,1fr)] items-start gap-x-2">
       <span className="truncate leading-7 text-muted-foreground" title={title}>{label}</span>
       <div className="grid min-w-0 gap-1.5">{children}{note}</div>
+    </div>
+  );
+}
+
+// ---------- where edits go: the chosen rule, or its dark-mode / screen-size version
+
+type WriteTarget = {
+  decls: Decl[];
+  write: (fn: (d: Decl[]) => Decl[]) => void;
+  /** the rule's key when edits go straight into it (no scope) */
+  key: string | null;
+  scoped: ReturnType<typeof store.scopedTargets> | null;
+};
+
+function writeTarget(target: Match | null): WriteTarget | null {
+  const src = target?.live.source;
+  if (!target || !src) return null;
+  if (isEverywhere(store.scope)) {
+    const key = target.live.key;
+    return { decls: store.declsOf(key), write: (fn) => store.setDecls(key, fn(store.declsOf(key))), key, scoped: null };
+  }
+  const scoped = store.scopedTargets(src);
+  const read = (t: (typeof scoped)[number]) => (t.key ? store.declsOf(t.key) : store.virtualDecls(t.file, t.rule));
+  return {
+    decls: read(scoped[0]!),
+    key: null,
+    scoped,
+    // the scoped rules mirror each other (dark mode by system setting, and by theme switch)
+    write: (fn) => {
+      const next = fn(read(scoped[0]!));
+      for (const t of scoped) {
+        if (t.key) store.setDecls(t.key, next);
+        else store.setVirtual(t.file, t.rule, next);
+      }
+    },
+  };
+}
+
+/** "When": which mode and screen size edits apply to. */
+function ScopePicker({ wt }: { wt: WriteTarget | null }) {
+  const scope = store.scope;
+  const widths = widthOptions([...store.sources.values()], window.innerWidth);
+  if (scope.width && !widths.some((w) => w.kind === scope.width!.kind && w.px === scope.width!.px)) widths.unshift(scope.width);
+  const setMode = (mode: Mode) => { store.scope = { ...scope, mode }; store.emit(); };
+  const setWidth = (v: string) => {
+    const [kind, px] = v.split(":");
+    store.scope = { ...scope, width: v ? ({ kind, px: Number(px) } as NonNullable<Width>) : null };
+    store.emit();
+  };
+  const dark = pageIsDark();
+  const cond = widthCondition(scope.width);
+  const hiddenNow = scope.mode === "dark" && !dark ? "The page is in light mode: switch it to dark to see these changes."
+    : scope.mode === "light" && dark ? "The page is in dark mode: switch it to light to see these changes."
+    : cond && !matchMedia(cond).matches ? "Not at this window width: resize the window to see these changes." : null;
+  const fresh = wt?.scoped?.filter((t) => !t.key) ?? [];
+  const existing = wt?.scoped?.filter((t) => t.key) ?? [];
+  return (
+    <div className="grid gap-1.5">
+      <div className="grid grid-cols-[44px_minmax(0,1fr)_minmax(0,1fr)] items-center gap-1.5">
+        <span className="text-muted-foreground">When</span>
+        <NativeSelect aria-label="Mode" value={scope.mode} className="font-sans" onChange={(e) => setMode(e.target.value as Mode)}>
+          {(["all", "dark", "light"] as Mode[]).map((m) => <option key={m} value={m}>{modeLabel(m)}</option>)}
+        </NativeSelect>
+        <NativeSelect aria-label="Screen size" value={scope.width ? `${scope.width.kind}:${scope.width.px}` : ""} className="font-sans" onChange={(e) => setWidth(e.target.value)}>
+          <option value="">{widthLabel(null)}</option>
+          {widths.map((w) => <option key={`${w.kind}:${w.px}`} value={`${w.kind}:${w.px}`}>{widthLabel(w)}</option>)}
+        </NativeSelect>
+      </div>
+      {wt?.scoped && (
+        <p className="text-[10.5px] leading-relaxed text-muted-foreground">
+          {existing.length > 0 && <>Edits <code className="font-mono">{short(existing.map((t) => store.sources.get(t.key!)?.selector).join(" + "), 60)}</code>. </>}
+          {fresh.length > 0 && (
+            <>Adds {fresh.length === 1 ? "a rule" : `${fresh.length} rules`} to {shortFile(fresh[0]!.file)} when you save
+              {fresh.length > 1 && scope.mode !== "all" ? " (this project switches dark mode by the system setting and by its theme switch)" : ""}.</>
+          )}
+        </p>
+      )}
+      {hiddenNow && (
+        <p className="flex items-start gap-1.5 rounded-md border border-warning/30 bg-warning/10 px-2 py-1.5 text-[11px] text-warning">
+          <CircleAlert className="mt-px size-3.5 shrink-0" />{hiddenNow}
+        </p>
+      )}
     </div>
   );
 }
@@ -347,7 +437,7 @@ function summarize(diffs: Difference[]): { key: string; group: GroupId; name: st
   return out;
 }
 
-function PasteStyle({ el, target }: { el: Element; target: Match | null }) {
+function PasteStyle({ el, target, wt }: { el: Element; target: Match | null; wt: WriteTarget | null }) {
   useStore();
   const [groups, setGroups] = useState<Set<GroupId>>(DEFAULT_GROUPS);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
@@ -362,16 +452,16 @@ function PasteStyle({ el, target }: { el: Element; target: Match | null }) {
     setGroups(next);
   };
   const paste = () => {
-    if (!target) return;
-    const key = target.live.key;
-    store.setDecls(key, pasteInto(store.declsOf(key), chosen));
+    if (!target || !wt) return;
+    wt.write((d) => pasteInto(d, chosen));
     // what does not show as copied: a token that means something else here, or a stronger style
     const cs = getComputedStyle(el);
     const off = chosen.filter((d) => cs.getPropertyValue(d.prop) !== d.target);
     const { winner } = cascade(el);
-    const local = off.filter((d) => winner.get(d.prop) === key);
-    if (local.length) store.setDecls(key, pasteInto(store.declsOf(key), local.map((d) => ({ ...d, value: d.target }))));
-    const stronger = off.filter((d) => winner.get(d.prop) !== key);
+    const key = wt.key;
+    const local = key ? off.filter((d) => winner.get(d.prop) === key) : [];
+    if (local.length) wt.write((d) => pasteInto(d, local.map((x) => ({ ...x, value: x.target }))));
+    const stronger = key ? off.filter((d) => winner.get(d.prop) !== key) : [];
     setResult(stronger.length
       ? { ok: false, text: `Pasted, except ${[...new Set(stronger.map((d) => friendly(d.prop.replace(/-(top|right|bottom|left)(-(left|right))?/, ""))))].join(", ")}: a stronger style keeps ${stronger.length === 1 ? "it" : "them"} as ${stronger.length === 1 ? "it is" : "they are"}: paste into that style instead (Changes apply to).` }
       : { ok: true, text: `Pasted ${rows.length} change${rows.length === 1 ? "" : "s"} into ${target.live.rule.selectorText}. Save to keep them.` });
@@ -417,7 +507,7 @@ function PasteStyle({ el, target }: { el: Element; target: Match | null }) {
             <span className="min-w-0 flex-1 truncate text-[10.5px] text-muted-foreground">
               {target ? <>into <code className="font-mono">{short(target.live.rule.selectorText, 26)}</code> ({countMatches(withoutStates(target.live.rule.selectorText))} el.)</> : "No style to paste into: add one under All styles"}
             </span>
-            <Button size="sm" disabled={!target || !chosen.length} onClick={paste}><ClipboardPaste /> Paste {rows.length}</Button>
+            <Button size="sm" disabled={!wt || !chosen.length} onClick={paste}><ClipboardPaste /> Paste {rows.length}</Button>
           </div>
         </>
       )}
@@ -611,7 +701,7 @@ function TextRow({ node, label: where }: { node: Text; label?: string }) {
 
 type QuickProps = {
   el: Element; cs: CSSStyleDeclaration; cas: Cascade; target: Match | null; editable: Match[];
-  inherited: Map<string, { el: Element; key: string }>;
+  inherited: Map<string, { el: Element; key: string }>; wt: WriteTarget | null;
 };
 
 /** A rule as a designer reads it: "`.by-h1` · 1 element · Screens up to 640px wide". */
@@ -622,10 +712,10 @@ function ruleLabel(m: Match) {
 }
 
 /** The everyday controls: type, colour, spacing, layout, written to one chosen rule. */
-function Quick({ el, cs, cas, target, editable, inherited }: QuickProps) {
-  const key = target?.live.key ?? null;
-  const decls = key ? store.declsOf(key) : [];
-  const write = (fn: (d: Decl[]) => Decl[]) => key && store.setDecls(key, fn(store.declsOf(key)));
+function Quick({ el, cs, cas, target, editable, inherited, wt }: QuickProps) {
+  const key = wt?.key ?? null; // null in a scope: the scoped rule decides, so "overridden" notes do not apply
+  const decls = wt?.decls ?? [];
+  const write = (fn: (d: Decl[]) => Decl[]) => wt?.write(fn);
   const set = (prop: string) => (v: string | null) => write((d) => writeProp(d, prop, v));
   const rank = (k: string) => (k === "inline" ? -1 : cas.matches.findIndex((m) => m.live.key === k));
   // a declaration in the target will not show if a rule with higher priority sets the same longhand
@@ -650,10 +740,11 @@ function Quick({ el, cs, cas, target, editable, inherited }: QuickProps) {
   return (
     <>
       <Section title="Changes apply to">
-        <NativeSelect aria-label="Rule the controls edit" value={key!} onChange={(e) => { store.target = e.target.value; store.emit(); }}>
+        <NativeSelect aria-label="Rule the controls edit" value={target.live.key} onChange={(e) => { store.target = e.target.value; store.emit(); }}>
           {editable.map((m) => <option key={m.live.key} value={m.live.key}>{ruleLabel(m)}</option>)}
         </NativeSelect>
         <RuleMeta m={target} />
+        <ScopePicker wt={wt} />
       </Section>
 
       <Section title="Typography">
@@ -1230,7 +1321,8 @@ function Footer() {
   const [saving, setSaving] = useState(false);
   const n = store.pending;
   const files = [...new Set([...store.edits.keys()].map((k) => store.sources.get(k)?.file).filter(Boolean))] as string[];
-  const what = [store.edits.size ? `${store.edits.size} style${store.edits.size === 1 ? "" : "s"}` : "", store.texts.size ? `${store.texts.size} text${store.texts.size === 1 ? "" : "s"}` : ""].filter(Boolean).join(" and ");
+  const styles = store.edits.size + store.virtuals.size;
+  const what = [styles ? `${styles} style${styles === 1 ? "" : "s"}` : "", store.texts.size ? `${store.texts.size} text${store.texts.size === 1 ? "" : "s"}` : ""].filter(Boolean).join(" and ");
   const msg = store.message;
   return (
     <footer className="grid shrink-0 gap-2 border-t bg-background px-3 py-2.5">
@@ -1252,6 +1344,12 @@ function Footer() {
               <div key={k} className="flex items-center justify-between gap-2">
                 <code className="truncate font-mono text-[11px] text-code">{store.sources.get(k)?.selector}</code>
                 <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => store.revert(k)}><Undo2 className="size-3" /> Revert</Button>
+              </div>
+            ))}
+            {[...store.virtuals.values()].map((v, i) => (
+              <div key={`v${i}`} className="flex items-center justify-between gap-2">
+                <code className="truncate font-mono text-[11px] text-code" title={`${v.media ? `@media ${v.media} ` : ""}${v.selector}`}>{v.selector}{v.media ? ` @${v.media}` : ""}</code>
+                <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => store.setVirtual(v.file, v, [])}><Undo2 className="size-3" /> Revert</Button>
               </div>
             ))}
             {[...store.texts.values()].map((c, i) => (
