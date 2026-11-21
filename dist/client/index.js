@@ -13,12 +13,13 @@ import {
   ruleKey,
   sameDecls,
   serializeDecls,
+  sizeQueryMatches,
   specificity,
   splitTop,
   weightName,
   writeProp,
   writeSides
-} from "../chunk-CLNWSQP6.js";
+} from "../chunk-RCYO64ZZ.js";
 import {
   __export
 } from "../chunk-MLKGABMK.js";
@@ -483,8 +484,26 @@ var Store = class {
 };
 var store = new Store();
 var shortFile = (f) => f.replace(/^(app|src)\//, "");
-function isActive(l) {
-  return l.conds.every((c) => c instanceof CSSMediaRule ? matchMedia(c.media.mediaText).matches : c instanceof CSSSupportsRule ? CSS.supports(c.conditionText) : true);
+function isActive(l, el) {
+  return l.conds.every((c) => c instanceof CSSMediaRule ? matchMedia(c.media.mediaText).matches : c instanceof CSSSupportsRule ? CSS.supports(c.conditionText) : typeof CSSContainerRule !== "undefined" && c instanceof CSSContainerRule ? el ? containerMatches(c, el) : true : true);
+}
+function containerMatches(rule, el) {
+  const name = rule.containerName;
+  const px2 = (v) => parseFloat(v) || 0;
+  for (let a = el.parentElement; a; a = a.parentElement) {
+    const cs = getComputedStyle(a);
+    if (!cs.containerType || cs.containerType === "normal") continue;
+    if (name && !cs.containerName.split(/\s+/).includes(name)) continue;
+    const box = a;
+    const env = {
+      width: box.clientWidth - px2(cs.paddingLeft) - px2(cs.paddingRight),
+      height: box.clientHeight - px2(cs.paddingTop) - px2(cs.paddingBottom),
+      em: px2(cs.fontSize),
+      rem: px2(getComputedStyle(document.documentElement).fontSize)
+    };
+    return sizeQueryMatches(rule.containerQuery, env) ?? true;
+  }
+  return false;
 }
 var conditionLabel = (l) => l.conds.map((c) => c instanceof CSSMediaRule ? `@media ${c.media.mediaText}` : c.cssText.split("{")[0].trim()).join(" ");
 var safeMatches = (el, sel) => {
@@ -505,7 +524,7 @@ function cascade(el) {
       const state = states ? states.join("") : null;
       const bare = states ? part.replace(STATES, "").replace(/\(\s*\)/g, "") || "*" : part;
       if (!safeMatches(el, bare)) continue;
-      const m = { live, spec: specificity(part), active: isActive(live), state, part };
+      const m = { live, spec: specificity(part), active: isActive(live, el), state, part };
       if (!best || best.state && !state || !!best.state === !!state && compareSpec(m.spec, best.spec) > 0) best = m;
     }
     if (best) {

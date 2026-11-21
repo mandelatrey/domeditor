@@ -17,13 +17,14 @@ import {
   ruleKey,
   sameDecls,
   serializeDecls,
+  sizeQueryMatches,
   specificity,
   splitTop,
   stepFor,
   weightName,
   writeProp,
   writeSides
-} from "../chunk-CLNWSQP6.js";
+} from "../chunk-RCYO64ZZ.js";
 import "../chunk-MLKGABMK.js";
 export {
   WEIGHT_NAMES,
@@ -44,6 +45,7 @@ export {
   ruleKey,
   sameDecls,
   serializeDecls,
+  sizeQueryMatches,
   specificity,
   splitTop,
   stepFor,

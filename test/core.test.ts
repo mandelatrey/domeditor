@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendRule, applyRuleEdit, createHandler, cssFiles, EditError, sourceRules } from "../src/core/server";
-import { alignRules, composeBox, expandBox, normSelector, nudge, readProp, specificity, writeProp, writeSides, type Decl } from "../src/core/shared";
+import { alignRules, composeBox, expandBox, normCondition, normSelector, nudge, readProp, sizeQueryMatches, specificity, writeProp, writeSides, type Decl } from "../src/core/shared";
 
 const d = (prop: string, value: string): Decl => ({ prop, value, important: false });
 
@@ -22,6 +22,36 @@ describe("domeditor: matching the browser's rules to the source", () => {
     expect(normSelector(".lp *::before")).toBe(normSelector(".lp ::before"));
     expect(normSelector("*, *::before, *::after")).toBe(normSelector("*, ::before, ::after"));
     expect(normSelector("[href*=wa]")).toBe("[href*=wa]");
+  });
+  it("spells a condition the same way however the compiler rewrote its ranges", () => {
+    // Lightning CSS (Next) rewrites container queries into range syntax
+    expect(normCondition("shop (width >= 720px)")).toBe(normCondition("shop (min-width: 720px)"));
+    expect(normCondition("(width <= 200px)")).toBe(normCondition("(max-width: 200px)"));
+    expect(normCondition("(400px <= width <= 700px)")).toBe(normCondition("(min-width: 400px) and (max-width: 700px)"));
+    expect(normCondition("(720px <= inline-size)")).toBe(normCondition("(min-inline-size: 720px)"));
+    // strict comparisons are not the same as min-/max-
+    expect(normCondition("(width > 720px)")).not.toBe(normCondition("(min-width: 720px)"));
+    expect(normCondition('(prefers-color-scheme: "dark")')).toBe("(prefers-color-scheme:dark)");
+  });
+  it("lines up a container query rule the compiler rewrote with its source", () => {
+    const css = "@container shop (min-width: 720px) {\n  .by-menu { border-radius: 22px; }\n}\n";
+    const { rules } = sourceRules(css, "a.css");
+    const out = alignRules([{ selector: normSelector(".by-menu"), context: [`container ${normCondition("shop" + "(width >= 720px)")}`] }], rules.map((r) => r.ref));
+    expect(out[0]!.kind).not.toBe("none");
+  });
+  it("evaluates a container size query", () => {
+    const env = { width: 1132, height: 400, em: 16, rem: 16 };
+    expect(sizeQueryMatches("(width >= 720px)", env)).toBe(true);
+    expect(sizeQueryMatches("(min-width: 1200px)", env)).toBe(false);
+    expect(sizeQueryMatches("(width <= 200px)", { ...env, width: 153 })).toBe(true);
+    expect(sizeQueryMatches("(560px <= width <= 899px)", { ...env, width: 700 })).toBe(true);
+    expect(sizeQueryMatches("(560px <= width <= 899px)", env)).toBe(false);
+    expect(sizeQueryMatches("(width > 1132px)", env)).toBe(false);
+    expect(sizeQueryMatches("(min-width: 40em)", { ...env, width: 640 })).toBe(true);
+    expect(sizeQueryMatches("(max-width: 300px) or (min-width: 1000px)", env)).toBe(true);
+    expect(sizeQueryMatches("(min-width: 30cqi)", env)).toBe(null);
+    expect(sizeQueryMatches("style(--dark: 1)", env)).toBe(null);
+    expect(sizeQueryMatches("not (min-width: 300px)", env)).toBe(null);
   });
   it("computes specificity", () => {
     expect(specificity("table.data th")).toEqual([0, 1, 2]);

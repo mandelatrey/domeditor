@@ -3,7 +3,56 @@ var ruleKey = (r) => JSON.stringify([r.file, r.context, r.selector, r.occurrence
 function normSelector(sel) {
   return sel.replace(/["']/g, "").replace(/\*(?=[.#:[])/g, "").replace(/\(\s*odd\s*\)/gi, "(2n+1)").replace(/\(\s*even\s*\)/gi, "(2n)").replace(/(^|[^:]):(before|after|first-line|first-letter)\b/gi, "$1::$2").replace(/\s+/g, " ").replace(/\s*([>+~,])\s*/g, "$1").replace(/\(\s+/g, "(").replace(/\s+\)/g, ")").trim();
 }
-var normCondition = (s) => s.toLowerCase().replace(/["'\s]/g, "");
+var normCondition = (s) => legacyRanges(s.toLowerCase().replace(/["'\s]/g, ""));
+var SIZE = "(width|height|inline-size|block-size|aspect-ratio)";
+var LEN = "(-?[\\d.]+[a-z%]*)";
+function legacyRanges(s) {
+  return s.replace(new RegExp(`\\(${LEN}<=${SIZE}<=${LEN}\\)`, "g"), "(min-$2:$1)and(max-$2:$3)").replace(new RegExp(`\\(${LEN}>=${SIZE}>=${LEN}\\)`, "g"), "(max-$2:$1)and(min-$2:$3)").replace(new RegExp(`\\(${SIZE}>=${LEN}\\)`, "g"), "(min-$1:$2)").replace(new RegExp(`\\(${SIZE}<=${LEN}\\)`, "g"), "(max-$1:$2)").replace(new RegExp(`\\(${LEN}<=${SIZE}\\)`, "g"), "(min-$2:$1)").replace(new RegExp(`\\(${LEN}>=${SIZE}\\)`, "g"), "(max-$2:$1)");
+}
+function sizeQueryMatches(query, env) {
+  const q = normCondition(query);
+  if (!q || /not\(|style\(/.test(q)) return null;
+  const len = (v) => {
+    const m = /^(-?[\d.]+)(px|em|rem)?$/.exec(v);
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    if (n === 0 && !m[2]) return 0;
+    return m[2] === "px" ? n : m[2] === "em" ? n * env.em : m[2] === "rem" ? n * env.rem : null;
+  };
+  const size = (f) => f === "width" || f === "inline-size" ? env.width : f === "height" || f === "block-size" ? env.height : null;
+  const feature = (part) => {
+    let m = /^\((min|max)-(width|height|inline-size|block-size):([^()]+)\)$/.exec(part);
+    if (m) {
+      const v = len(m[3]), have = size(m[2]);
+      if (v === null || have === null) return null;
+      return m[1] === "min" ? have >= v : have <= v;
+    }
+    m = /^\((width|height|inline-size|block-size)(<|>)([^()=]+)\)$/.exec(part);
+    if (m) {
+      const v = len(m[3]), have = size(m[1]);
+      if (v === null || have === null) return null;
+      return m[2] === ">" ? have > v : have < v;
+    }
+    m = /^\(([^()<>=]+)(<|>)(width|height|inline-size|block-size)\)$/.exec(part);
+    if (m) {
+      const v = len(m[1]), have = size(m[3]);
+      if (v === null || have === null) return null;
+      return m[2] === "<" ? v < have : v > have;
+    }
+    return null;
+  };
+  let any = false;
+  for (const alt of q.split(/\)or\(/).map((a, i, all) => (i > 0 ? "(" : "") + a + (i < all.length - 1 ? ")" : ""))) {
+    let all = true;
+    for (const part of alt.split(/\)and\(/).map((a, i, xs) => (i > 0 ? "(" : "") + a + (i < xs.length - 1 ? ")" : ""))) {
+      const r = feature(part);
+      if (r === null) return null;
+      all &&= r;
+    }
+    any ||= all;
+  }
+  return any;
+}
 function splitTop(s, sep = ",") {
   const out = [];
   let depth = 0, cur = "";
@@ -273,6 +322,14 @@ function alignRules(items, sources) {
   return out;
 }
 function describeCondition(text) {
+  const cq = /^@container\s+(?:([a-z_-][\w-]*)\s*)?(\(.*)$/is.exec(text.trim());
+  if (cq && !/^(not|style)$/i.test(cq[1] ?? "")) {
+    const size = describeCondition(cq[2]);
+    const phrase = /^Screens (.+?)(?: wide)?$/.exec(size);
+    if (!phrase || size.includes(",")) return text.trim();
+    const what = cq[1] ? `the \u201C${cq[1]}\u201D container` : "its container";
+    return `When ${what} is ${phrase[1].startsWith("up to") || /–/.test(phrase[1]) ? `${phrase[1]} wide` : phrase[1]}`;
+  }
   const t = text.replace(/^@(media|supports|container)\s*/i, "").trim();
   const words = [];
   let rest = t;
@@ -352,6 +409,7 @@ export {
   ruleKey,
   normSelector,
   normCondition,
+  sizeQueryMatches,
   splitTop,
   specificity,
   compareSpec,

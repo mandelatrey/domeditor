@@ -1,7 +1,7 @@
 // Browser half of domeditor: finds the project's rules in the live stylesheets, works out which ones
 // apply to an element (and which declarations win), and keeps unsaved edits, previewed live.
 import {
-  alignRules, compareSpec, normCondition, normSelector, ruleKey, sameDecls, serializeDecls, specificity, splitTop,
+  alignRules, compareSpec, normCondition, normSelector, ruleKey, sameDecls, serializeDecls, sizeQueryMatches, specificity, splitTop,
   type Decl, type RuleRef, type SourceRule, type Spec,
 } from "../core/shared";
 import { EVERYWHERE, modePattern, scopedContext, scopedRules, type ModePattern, type Scope, type ScopedRule } from "../core/scope";
@@ -474,11 +474,36 @@ export const store = new Store();
 
 export const shortFile = (f: string) => f.replace(/^(app|src)\//, "");
 
-export function isActive(l: LiveRule): boolean {
+/** Does the rule apply now? Media and supports conditions ask the browser; a container query is
+ *  checked against the size of `el`'s container (without an element, it counts as applying). */
+export function isActive(l: LiveRule, el?: Element): boolean {
   return l.conds.every((c) =>
     c instanceof CSSMediaRule ? matchMedia(c.media.mediaText).matches
     : c instanceof CSSSupportsRule ? CSS.supports(c.conditionText)
+    : typeof CSSContainerRule !== "undefined" && c instanceof CSSContainerRule ? (el ? containerMatches(c, el) : true)
     : true);
+}
+
+/** The browser has no matchMedia for container queries: find the container the query is asked of
+ *  (the nearest ancestor that is a container, with that name if the query names one), measure its
+ *  content box, and evaluate the query. */
+function containerMatches(rule: CSSContainerRule, el: Element): boolean {
+  const name = rule.containerName;
+  const px = (v: string) => parseFloat(v) || 0;
+  for (let a = el.parentElement; a; a = a.parentElement) {
+    const cs = getComputedStyle(a);
+    if (!cs.containerType || cs.containerType === "normal") continue;
+    if (name && !cs.containerName.split(/\s+/).includes(name)) continue;
+    const box = a as HTMLElement;
+    const env = {
+      width: box.clientWidth - px(cs.paddingLeft) - px(cs.paddingRight),
+      height: box.clientHeight - px(cs.paddingTop) - px(cs.paddingBottom),
+      em: px(cs.fontSize),
+      rem: px(getComputedStyle(document.documentElement).fontSize),
+    };
+    return sizeQueryMatches(rule.containerQuery, env) ?? true; // a query we cannot read: assume it applies, as before
+  }
+  return false; // no such container: the browser never applies the rule
 }
 
 export const conditionLabel = (l: LiveRule) =>
@@ -504,7 +529,7 @@ export function cascade(el: Element): Cascade {
       const state = states ? states.join("") : null;
       const bare = states ? part.replace(STATES, "").replace(/\(\s*\)/g, "") || "*" : part;
       if (!safeMatches(el, bare)) continue;
-      const m: Match = { live, spec: specificity(part), active: isActive(live), state, part };
+      const m: Match = { live, spec: specificity(part), active: isActive(live, el), state, part };
       if (!best || (best.state && !state) || (!!best.state === !!state && compareSpec(m.spec, best.spec) > 0)) best = m;
     }
     if (best) {
