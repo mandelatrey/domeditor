@@ -1,7 +1,7 @@
 // The editor panel: pick an element, adjust type, spacing and layout with live preview, save the
 // change into the .css file its rule came from. Rendered inside a shadow root (see index.tsx).
 import {
-  AlignCenter, AlignJustify, AlignLeft, AlignRight, ArrowDown, ArrowUp, Check, ChevronRight, CircleAlert,
+  AlignCenter, AlignJustify, AlignLeft, AlignRight, ArrowDown, ArrowUp, Check, ChevronRight, CircleAlert, ClipboardPaste, Copy,
   CornerDownLeft, Database, FileCode, Link2, Minus, MousePointer2, PanelLeft, PanelRight, Plus, SquareDashedMousePointer, Undo2, X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
@@ -10,6 +10,7 @@ import {
   type Decl, type Side,
 } from "../core/shared";
 import { toHex } from "./color";
+import { copyStyle, cssText, differences, GROUPS, pasteInto, type Copied, type Difference, type GroupId } from "./copyStyle";
 import {
   cascade, conditionLabel, defaultTarget, inheritedFrom, label, segmentsFor, shortFile, store, suggestSelector, textIndex,
   type Cascade, type Match, type Piece, type Place, type TextIndex, type TextKey,
@@ -219,7 +220,7 @@ function Inspector({ el }: { el: Element }) {
 
   return (
     <>
-      <section className="grid gap-1.5 border-b px-3 pt-2.5 pb-3">
+      <section className="grid grid-cols-[minmax(0,1fr)] gap-1.5 border-b px-3 pt-2.5 pb-3">
         <nav aria-label="Parents" className="flex flex-wrap items-center gap-0.5 font-mono text-[10.5px] text-muted-foreground">
           {ancestors.slice(-4).map((a, i) => (
             <span key={i} className="inline-flex items-center gap-0.5">
@@ -230,9 +231,13 @@ function Inspector({ el }: { el: Element }) {
             </span>
           ))}
         </nav>
-        <div className="flex items-center gap-2">
-          <code className="min-w-0 flex-1 truncate font-mono text-[12.5px] font-medium text-primary" title={label(el)}>{label(el)}</code>
-          <Badge variant="outline" className="font-mono">{Math.round(r.width)} × {Math.round(r.height)}</Badge>
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2">
+          <code className="truncate font-mono text-[12.5px] font-medium text-primary" title={label(el)}>{label(el)}</code>
+          <div className="flex items-center gap-0.5">
+          <Badge variant="outline" className="mr-1 font-mono">{Math.round(r.width)} × {Math.round(r.height)}</Badge>
+          <Tip label="Copy this element's look, to paste onto another element">
+            <Button size="icon-sm" variant="ghost" aria-label="Copy style" onClick={() => copyLook(el)}><Copy /></Button>
+          </Tip>
           <Tip label="Select the parent">
             <Button size="icon-sm" variant="ghost" aria-label="Parent" disabled={!el.parentElement || el.parentElement === document.documentElement}
               onClick={() => el.parentElement && store.select(el.parentElement)}><ArrowUp /></Button>
@@ -241,6 +246,7 @@ function Inspector({ el }: { el: Element }) {
             <Button size="icon-sm" variant="ghost" aria-label="First child" disabled={!el.children.length}
               onClick={() => el.children[0] && store.select(el.children[0])}><ArrowDown /></Button>
           </Tip>
+          </div>
         </div>
         <div className="text-[11px] text-muted-foreground">
           {px(cs.fontSize)} · {weightName(cs.fontWeight)} {cs.fontWeight} · line {lineHeightRatio(cs)}
@@ -261,6 +267,7 @@ function Inspector({ el }: { el: Element }) {
           </TabsList>
         </div>
         <TabsContent value="design">
+          {clipboard && clipboard.from !== el && <PasteStyle key={nodeId(el)} el={el} target={target} />}
           <TextSection el={el} />
           <Quick el={el} cs={cs} cas={cas} target={target} editable={editable} inherited={inherited} />
         </TabsContent>
@@ -298,6 +305,124 @@ function Row({ label, title, note, children }: { label: string; title?: string; 
       <span className="truncate leading-7 text-muted-foreground" title={title}>{label}</span>
       <div className="grid min-w-0 gap-1.5">{children}{note}</div>
     </div>
+  );
+}
+
+// ---------- copy one element's look onto another
+
+let clipboard: Copied | null = null;
+const DEFAULT_GROUPS = () => new Set(GROUPS.filter((g) => g.on).map((g) => g.id));
+
+function copyLook(el: Element) {
+  clipboard = copyStyle(el, label(el));
+  // also as CSS, for pasting into code
+  void navigator.clipboard?.writeText(cssText(clipboard, DEFAULT_GROUPS())).catch(() => {});
+  store.message = { kind: "ok", text: `Copied the look of ${short(label(el), 30)}. Select another element to paste it.` };
+  store.emit();
+}
+
+/** Changes as a designer counts them: four sides set to one value read as one ("Border color"). */
+function summarize(diffs: Difference[]): { key: string; group: GroupId; name: string; now: string; value: string }[] {
+  const out: { key: string; group: GroupId; name: string; now: string; value: string }[] = [];
+  const used = new Set<string>();
+  const sets: [string, string[]][] = [
+    ["padding", ["top", "right", "bottom", "left"].map((s) => `padding-${s}`)],
+    ["margin", ["top", "right", "bottom", "left"].map((s) => `margin-${s}`)],
+    ["border-radius", ["top-left", "top-right", "bottom-right", "bottom-left"].map((c) => `border-${c}-radius`)],
+    ...["width", "style", "color"].map((part): [string, string[]] => [`border-${part}`, ["top", "right", "bottom", "left"].map((s) => `border-${s}-${part}`)]),
+    ["gap", ["row-gap", "column-gap"]],
+  ];
+  const by = new Map(diffs.map((d) => [d.prop, d]));
+  for (const d of diffs) {
+    if (used.has(d.prop)) continue;
+    const set = sets.find(([, props]) => props.includes(d.prop) && props.every((p) => by.get(p)?.value === d.value));
+    if (set) {
+      set[1].forEach((p) => used.add(p));
+      out.push({ key: set[0], group: d.group, name: friendly(set[0]), now: d.now, value: d.value });
+    } else {
+      used.add(d.prop);
+      out.push({ key: d.prop, group: d.group, name: friendly(d.prop), now: d.now, value: d.value });
+    }
+  }
+  return out;
+}
+
+function PasteStyle({ el, target }: { el: Element; target: Match | null }) {
+  useStore();
+  const [groups, setGroups] = useState<Set<GroupId>>(DEFAULT_GROUPS);
+  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const copied = clipboard!;
+  const diffs = differences(copied, el);
+  const chosen = diffs.filter((d) => groups.has(d.group));
+  const rows = summarize(chosen);
+  const toggle = (id: GroupId) => {
+    const next = new Set(groups);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setGroups(next);
+  };
+  const paste = () => {
+    if (!target) return;
+    const key = target.live.key;
+    store.setDecls(key, pasteInto(store.declsOf(key), chosen));
+    // what does not show as copied: a token that means something else here, or a stronger style
+    const cs = getComputedStyle(el);
+    const off = chosen.filter((d) => cs.getPropertyValue(d.prop) !== d.target);
+    const { winner } = cascade(el);
+    const local = off.filter((d) => winner.get(d.prop) === key);
+    if (local.length) store.setDecls(key, pasteInto(store.declsOf(key), local.map((d) => ({ ...d, value: d.target }))));
+    const stronger = off.filter((d) => winner.get(d.prop) !== key);
+    setResult(stronger.length
+      ? { ok: false, text: `Pasted, except ${[...new Set(stronger.map((d) => friendly(d.prop.replace(/-(top|right|bottom|left)(-(left|right))?/, ""))))].join(", ")}: a stronger style keeps ${stronger.length === 1 ? "it" : "them"} as ${stronger.length === 1 ? "it is" : "they are"}: paste into that style instead (Changes apply to).` }
+      : { ok: true, text: `Pasted ${rows.length} change${rows.length === 1 ? "" : "s"} into ${target.live.rule.selectorText}. Save to keep them.` });
+  };
+  const count = (id: GroupId) => summarize(diffs.filter((d) => d.group === id)).length;
+
+  return (
+    <section className="grid gap-2.5 border-b bg-primary/5 px-3 py-3">
+      <div className="flex items-center gap-2">
+        <ClipboardPaste className="size-3.5 text-primary" />
+        <span className="min-w-0 flex-1 truncate text-[11.5px]">Paste the look of <code className="font-mono text-primary">{short(copied.label, 28)}</code></span>
+        <Tip label="Forget the copied look">
+          <Button size="icon-sm" variant="ghost" aria-label="Forget the copied look" className="size-5" onClick={() => { clipboard = null; store.emit(); }}><X /></Button>
+        </Tip>
+      </div>
+      {diffs.length === 0 ? (
+        <p className="text-[11px] text-muted-foreground">This element already looks the same.</p>
+      ) : (
+        <>
+          <div className="flex flex-wrap gap-1">
+            {GROUPS.filter((g) => count(g.id)).map((g) => (
+              <button key={g.id} type="button" aria-pressed={groups.has(g.id)} onClick={() => toggle(g.id)}
+                className={cn("inline-flex h-6 items-center gap-1 rounded-md border px-2 text-[11px] text-muted-foreground hover:text-foreground",
+                  groups.has(g.id) && "border-primary bg-primary/15 text-foreground")}>
+                {groups.has(g.id) && <Check className="size-3" />}{g.label} <span className="tabular-nums opacity-70">{count(g.id)}</span>
+              </button>
+            ))}
+          </div>
+          <Collapsible>
+            <CollapsibleTrigger className="group flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground">
+              <ChevronRight className="size-3 transition-transform group-data-[state=open]:rotate-90" /> What changes ({rows.length})
+            </CollapsibleTrigger>
+            <CollapsibleContent className="mt-1.5 grid gap-0.5">
+              {rows.map((d) => (
+                <div key={d.key} className="grid grid-cols-[110px_minmax(0,1fr)] gap-2 text-[10.5px]">
+                  <span className="truncate text-muted-foreground" title={d.key}>{d.name}</span>
+                  <span className="truncate font-mono" title={`${d.now} → ${d.value}`}><span className="text-muted-foreground line-through">{short(d.now, 14)}</span> → {short(d.value, 22)}</span>
+                </div>
+              ))}
+            </CollapsibleContent>
+          </Collapsible>
+          <div className="flex items-center gap-2">
+            <span className="min-w-0 flex-1 truncate text-[10.5px] text-muted-foreground">
+              {target ? <>into <code className="font-mono">{short(target.live.rule.selectorText, 26)}</code> ({countMatches(withoutStates(target.live.rule.selectorText))} el.)</> : "No style to paste into: add one under All styles"}
+            </span>
+            <Button size="sm" disabled={!target || !chosen.length} onClick={paste}><ClipboardPaste /> Paste {rows.length}</Button>
+          </div>
+        </>
+      )}
+      {result && <p className={cn("text-[11px]", result.ok ? "text-success" : "text-warning")}>{result.text}</p>}
+    </section>
   );
 }
 
@@ -931,7 +1056,9 @@ const FRIENDLY: Record<string, string> = {
   left: "Left", inset: "Inset", "z-index": "Stacking", overflow: "Overflow", "justify-content": "Justify", "align-items": "Align items",
   "align-self": "Align self", "flex-direction": "Direction", "flex-wrap": "Wrap", flex: "Flex", "grid-template-columns": "Columns",
   "grid-template-rows": "Rows", transition: "Transition", transform: "Transform", cursor: "Cursor", "box-sizing": "Box sizing",
-  "object-fit": "Image fit", "overflow-wrap": "Word breaking", "word-break": "Word breaking", "pointer-events": "Clicks", "aspect-ratio": "Aspect ratio", outline: "Outline", "outline-offset": "Outline offset",
+  "border-style": "Border style", "text-decoration-line": "Underline",
+  "border-top-left-radius": "Corner top left", "border-top-right-radius": "Corner top right", "border-bottom-right-radius": "Corner bottom right",
+  "border-bottom-left-radius": "Corner bottom left", "object-fit": "Image fit", "overflow-wrap": "Word breaking", "word-break": "Word breaking", "pointer-events": "Clicks", "aspect-ratio": "Aspect ratio", outline: "Outline", "outline-offset": "Outline offset",
 };
 const friendly = (prop: string) => (prop.startsWith("--") ? prop : FRIENDLY[prop] ?? prop);
 const isColorish = (prop: string, value: string) =>

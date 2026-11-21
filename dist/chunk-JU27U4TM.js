@@ -178,6 +178,10 @@ function shorthandOf(prop) {
   if (prop === "font-size" || prop === "line-height" || prop === "font-weight") {
     return { name: "font", read: (v) => readFont(v, prop), write: (v, x) => writeFont(v, prop, x) };
   }
+  if (prop === "background-color") {
+    const plain = (v) => splitTop(v, " ").length === 1 && !/url\(|gradient\(|image\(/i.test(v);
+    return { name: "background", read: (v) => plain(v) ? v : null, write: (v, x) => plain(v) ? x : null };
+  }
   return null;
 }
 function readProp(decls, prop) {

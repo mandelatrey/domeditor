@@ -22,6 +22,13 @@ of it in a production build.
   - **Spacing** (a box model for margin and padding, and gaps), **layout** (flex/grid alignment) and **size**.
   - Type values, use −/+, or <kbd>↑</kbd>/<kbd>↓</kbd> on any number (<kbd>Shift</kbd> ×10, <kbd>Alt</kbd> ×0.1).
     Shorthands are edited in place (`padding: 18px 20px` stays one line; `font: 650 clamp(…)/1.04 …` keeps its shape).
+- **Copy style** (the copy icon next to the element's name) takes the selected element's look: what you see,
+  including unsaved edits and inherited text styles. Select another element and a **Paste the look of…**
+  card shows only what differs, grouped (Typography, Colour, Border & corners, Padding & gap, Layout, and,
+  off by default because they depend on where an element sits, Size and Margin). Paste writes into the
+  style chosen under *Changes apply to*, using the source's own values where it has them (`var(--token)`,
+  `rem`, `clamp()`), as shorthands where every side matches. What a stronger style keeps is reported. The
+  look is also put on the system clipboard as CSS.
 - **All styles** tab: every style that applies to the element, grouped as *on this element*, *other screen
   sizes* ("Screens up to 640px wide"), *hover, focus and other states*, and collapsed *base styles*
   (page-wide defaults, framework styles). Properties have plain names, colours show a swatch, and a value a

@@ -89,6 +89,9 @@ describe("domeditor: editing values", () => {
     expect(writeProp([d("font", "inherit")], "font-size", "15px")).toEqual([d("font", "inherit"), d("font-size", "15px")]);
     expect(readProp([d("font", "500 11px var(--f-mono)")], "font-weight")).toBe("500");
     expect(readProp([d("padding", "8px 14px")], "padding-right")).toBe("14px");
+    expect(writeProp([d("background", "rgba(0, 0, 0, 0.08)")], "background-color", "var(--panel)")).toEqual([d("background", "var(--panel)")]);
+    expect(writeProp([d("background", "url(a.png) no-repeat")], "background-color", "red")).toEqual([d("background", "url(a.png) no-repeat"), d("background-color", "red")]);
+    expect(readProp([d("background", "var(--panel)")], "background-color")).toBe("var(--panel)");
   });
   it("adds, updates and removes plain properties", () => {
     expect(writeProp([d("gap", "8px")], "text-align", "center")).toEqual([d("gap", "8px"), d("text-align", "center")]);
