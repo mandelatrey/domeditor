@@ -26,6 +26,12 @@ export function mountDomEditor(options: MountOptions = {}) {
   if (options.endpoint) store.endpoint = options.endpoint;
 
   const host = document.createElement("domeditor-root");
+  // Scrolling inside the panel scrolls the panel, not the page. Smooth-scroll libraries (Lenis,
+  // Locomotive, GSAP ScrollSmoother...) listen for the wheel on the window and scroll the page
+  // themselves; Lenis skips elements marked data-lenis-prevent, and for the others the events stop
+  // here, before they reach the window. The panel's own (native) scrolling is unaffected.
+  host.setAttribute("data-lenis-prevent", "");
+  for (const type of ["wheel", "touchstart", "touchmove"]) host.addEventListener(type, (e) => e.stopPropagation(), { passive: true });
   const shadow = host.attachShadow({ mode: "open" });
   const sheet = new CSSStyleSheet();
   sheet.replaceSync(css);

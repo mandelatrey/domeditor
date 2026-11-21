@@ -11561,6 +11561,8 @@ function mountDomEditor(options = {}) {
   mounted = true;
   if (options.endpoint) store.endpoint = options.endpoint;
   const host = document.createElement("domeditor-root");
+  host.setAttribute("data-lenis-prevent", "");
+  for (const type of ["wheel", "touchstart", "touchmove"]) host.addEventListener(type, (e) => e.stopPropagation(), { passive: true });
   const shadow = host.attachShadow({ mode: "open" });
   const sheet = new CSSStyleSheet();
   sheet.replaceSync(styles_generated_default);
