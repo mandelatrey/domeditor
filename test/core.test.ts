@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendRule, applyRuleEdit, createHandler, cssFiles, EditError, sourceRules } from "../src/core/server";
-import { alignRules, composeBox, expandBox, normCondition, normSelector, nudge, readProp, sizeQueryMatches, specificity, writeProp, writeSides, type Decl } from "../src/core/shared";
+import { alignRules, composeBox, expandBox, normCondition, normSelector, nudge, parseDecls, readProp, sizeQueryMatches, specificity, writeProp, writeSides, type Decl } from "../src/core/shared";
 
 const d = (prop: string, value: string): Decl => ({ prop, value, important: false });
 
@@ -38,6 +38,15 @@ describe("domeditor: matching the browser's rules to the source", () => {
     const { rules } = sourceRules(css, "a.css");
     const out = alignRules([{ selector: normSelector(".by-menu"), context: [`container ${normCondition("shop" + "(width >= 720px)")}`] }], rules.map((r) => r.ref));
     expect(out[0]!.kind).not.toBe("none");
+  });
+  it("reads a rule's declarations from its text (for rules with no source file)", () => {
+    expect(parseDecls("color: var(--color-mute); font: 500 14px / 1 var(--f-sans); padding: 9px 12px;")).toEqual([
+      d("color", "var(--color-mute)"), d("font", "500 14px / 1 var(--f-sans)"), d("padding", "9px 12px"),
+    ]);
+    expect(parseDecls('background: url("a;b.png") !important; content: ";"')).toEqual([
+      { prop: "background", value: 'url("a;b.png")', important: true }, d("content", '";"'),
+    ]);
+    expect(parseDecls("")).toEqual([]);
   });
   it("evaluates a container size query", () => {
     const env = { width: 1132, height: 400, em: 16, rem: 16 };

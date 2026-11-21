@@ -1,7 +1,7 @@
 // Browser half of domeditor: finds the project's rules in the live stylesheets, works out which ones
 // apply to an element (and which declarations win), and keeps unsaved edits, previewed live.
 import {
-  alignRules, compareSpec, normCondition, normSelector, ruleKey, sameDecls, serializeDecls, sizeQueryMatches, specificity, splitTop,
+  alignRules, compareSpec, normCondition, normSelector, ruleKey, parseDecls, sameDecls, serializeDecls, sizeQueryMatches, specificity, splitTop,
   type Decl, type RuleRef, type SourceRule, type Spec,
 } from "../core/shared";
 import { EVERYWHERE, modePattern, scopedContext, scopedRules, type ModePattern, type Scope, type ScopedRule } from "../core/scope";
@@ -16,6 +16,9 @@ export type LiveRule = {
   order: number; // position in the whole document's cascade order
   conds: CSSRule[]; // the @media/@supports blocks around it
   source?: SourceRule;
+  /** Where a rule without a source file came from: a <style> element on the page (often a
+   *  component's `<style>{`...`}</style>`, or CSS-in-JS), or a compiled stylesheet (Tailwind...). */
+  origin?: "style-tag" | "stylesheet";
 };
 
 /** Where a text is written in the project: a file and line. */
@@ -115,6 +118,8 @@ export type Match = {
 export type Cascade = {
   matches: Match[]; // highest priority first
   applied: Set<string>; // `${key}#${declIndex}` of declarations that win at least one longhand
+  /** `${key}#${declIndex}` of state declarations (`:hover`...) a stronger rule for the same state beats. */
+  stateOverridden: Set<string>;
   winner: Map<string, string>; // longhand -> rule key that sets it (or "inline")
   inline: Decl[];
 };
@@ -217,12 +222,17 @@ class Store {
     if (run !== this.indexRun) return; // a newer reindex started while this one waited
     const out: LiveRule[] = [];
     let order = 0, unknown = 0;
+    let origin: LiveRule["origin"];
     const push = (r: Item, source?: SourceRule) => {
       const ref = source ?? { file: r.file ?? "", context: r.context, selector: r.selector, occurrence: -1 };
-      out.push({ key: source ? ruleKey(source) : `live:${unknown++}`, ref, rule: r.rule, order: order++, conds: r.conds, source });
+      out.push({
+        key: source ? ruleKey(source) : `live:${unknown++}`, ref, rule: r.rule, order: order++, conds: r.conds, source,
+        ...(source ? {} : { origin }),
+      });
     };
     for (const { sheet, fileOf } of sheets) {
       if ((sheet.ownerNode as Element | null)?.hasAttribute?.("data-domeditor-preview")) continue;
+      origin = sheet.ownerNode instanceof HTMLStyleElement && !sheet.href ? "style-tag" : "stylesheet";
       const items = styleRules(sheet, fileOf);
       if (fileOf) {
         // Vite or Turbopack said which file each rule came from: line them up with that file's source, in order
@@ -240,11 +250,13 @@ class Store {
           }
         }
       } else {
-        // no file information (an inline <style>, or `next dev` without Turbopack): use a rule only if
-        // exactly one source rule has its selector and context
+        // no file information (an inline <style>, or `next dev` without Turbopack): link a rule to its
+        // source only if exactly one source rule has its selector and context. The rest are still listed,
+        // read-only: they take part in the cascade, so what they override (or not) is shown truthfully.
         for (const it of items) {
           const cands = [...this.sources.values()].filter((s) => s.selector === it.selector && JSON.stringify(s.context) === JSON.stringify(it.context));
           if (cands.length === 1) push(it, cands[0]);
+          else push(it);
         }
       }
     }
@@ -253,7 +265,14 @@ class Store {
   }
 
   declsOf(key: string): Decl[] {
-    return this.edits.get(key) ?? this.sources.get(key)?.decls ?? [];
+    return this.edits.get(key) ?? this.sources.get(key)?.decls ?? this.liveDecls(key);
+  }
+
+  /** A rule with no source file: its declarations as the browser holds them. Read from cssText, not
+   *  the longhands: a shorthand with a var() (`font: 500 14px/1 var(--f)`) leaves its longhands empty. */
+  private liveDecls(key: string): Decl[] {
+    const style = this.live.find((l) => l.key === key)?.rule.style;
+    return style ? parseDecls(style.cssText) : [];
   }
 
   private preview(key: string, decls: Decl[]) {
@@ -566,7 +585,25 @@ export function cascade(el: Element): Cascade {
     }
     if (wins) applied.add(c.id);
   }
-  return { matches, applied, winner, inline };
+  // States (`:hover`...) are not in the cascade above, which is what applies now. Among the rules
+  // for the same state, a stronger one still beats a weaker one: mark what it overrides.
+  const stateOverridden = new Set<string>();
+  const byState = new Map<string, Match[]>();
+  for (const m of matches) if (m.state && m.active) byState.set(m.state, [...(byState.get(m.state) ?? []), m]);
+  for (const list of byState.values()) {
+    const taken = new Set<string>(); // longhands a stronger rule for this state sets (matches are strongest first)
+    for (const m of list) {
+      const decls = store.declsOf(m.live.key);
+      const mine = new Set<string>();
+      decls.forEach((d, i) => {
+        const lhs = longhands(d.prop, d.value);
+        if (lhs.length && lhs.every((lh) => taken.has(lh) && !d.important)) stateOverridden.add(`${m.live.key}#${i}`);
+        lhs.forEach((lh) => mine.add(lh));
+      });
+      mine.forEach((lh) => taken.add(lh));
+    }
+  }
+  return { matches, applied, winner, inline, stateOverridden };
 }
 
 /** The rule the quick controls edit by default: the element's own class rule (`.fact`, `.btn.primary`)
@@ -786,3 +823,4 @@ function unmerge(item: Item, sources: SourceRule[], fileOf: FileOf): Item[] | nu
     return null;
   }
 }
+

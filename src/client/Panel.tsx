@@ -807,11 +807,15 @@ function Quick({ el, cs, cas, target, editable, inherited, wt }: QuickProps) {
 
 function Note({ prop, over, from }: { prop: string; over: string | null; from: { el: Element; key: string } | null }) {
   if (over) {
-    const sel = over === "inline" ? "an inline style" : store.sources.get(over)?.selector ?? "another style";
+    const live = over === "inline" ? null : store.live.find((l) => l.key === over);
+    const editable = !!live?.source;
+    const sel = over === "inline" ? "an inline style" : live?.source?.selector ?? live?.rule.selectorText ?? "another style";
+    const where = over === "inline" ? "" : editable ? " Click to edit that one instead."
+      : live?.origin === "style-tag" ? " It is written in a <style> tag in a component: change it there." : " It is not in your CSS files.";
     return (
-      <Tip label={`A stronger style sets ${prop}, so changes here will not show.${over === "inline" ? "" : " Click to edit that one instead."}`}>
+      <Tip label={`A stronger style sets ${prop}, so changes here will not show.${where}`}>
         <button type="button" className="justify-self-start truncate text-left text-[10.5px] text-warning hover:underline"
-          onClick={() => { if (over !== "inline") { store.target = over; store.emit(); } }}>
+          onClick={() => { if (editable) { store.target = over; store.emit(); } }}>
           overridden by {short(sel, 28)}
         </button>
       </Tip>
@@ -1155,12 +1159,16 @@ const friendly = (prop: string) => (prop.startsWith("--") ? prop : FRIENDLY[prop
 const isColorish = (prop: string, value: string) =>
   /color|^background$|^fill$|^stroke$/.test(prop) && typeof CSS !== "undefined" && CSS.supports("color", value);
 
-/** Page-wide defaults (`*`, `html`, `body`) and styles not written in a source file (Tailwind's). */
-const isBase = (m: Match) => !m.live.source || /^(\*|html|body|:root|:host)(?![\w-])/.test(m.part.trim());
+/** Page-wide defaults (`*`, `html`, `body`) and framework styles (Tailwind's). A component's own
+ *  `<style>` rules are not base styles: they are listed with the rest, read-only. */
+const isBase = (m: Match) =>
+  (!m.live.source && m.live.origin !== "style-tag") || /^(\*|html|body|:root|:host)(?![\w-])/.test(m.part.trim());
+/** Written by you (a .css file or a <style> tag), as opposed to a framework. */
+const yours = (m: Match) => !!m.live.source || m.live.origin === "style-tag";
 
 function AllStyles({ el, cas, target }: { el: Element; cas: Cascade; target: Match | null }) {
-  const states = cas.matches.filter((m) => m.state && m.live.source);
-  const screens = cas.matches.filter((m) => !m.state && !m.active && m.live.source);
+  const states = cas.matches.filter((m) => m.state && yours(m));
+  const screens = cas.matches.filter((m) => !m.state && !m.active && yours(m));
   const here = cas.matches.filter((m) => !m.state && m.active && !isBase(m));
   const base = cas.matches.filter((m) => !states.includes(m) && !screens.includes(m) && !here.includes(m));
   const card = (m: Match) => <StyleCard key={m.live.key} m={m} cas={cas} isTarget={m === target} />;
@@ -1223,12 +1231,35 @@ function StyleCard({ m, cas, isTarget }: { m: Match; cas: Cascade; isTarget: boo
         )}
       </div>
       <RuleMeta m={m} />
-      {!src ? (
+      {!src && m.live.origin === "style-tag" ? (
+        <div className="grid gap-1.5">
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Written in a <code className="font-mono">&lt;style&gt;</code> tag (a component&apos;s own styles), not in a .css file,
+            so it can&apos;t be edited here. Change it in the component, or move it into a .css file.
+          </p>
+          {decls.map((d, i) => {
+            const id = `${key}#${i}`;
+            const applied = m.state ? !cas.stateOverridden.has(id) : cas.applied.has(id) || !m.active;
+            return (
+              <div key={`${d.prop}-${i}`} className={cn("grid grid-cols-[100px_minmax(0,1fr)] items-center gap-1.5", !applied && "opacity-60")}>
+                <span className="grid min-w-0 leading-tight">
+                  <span className="truncate text-[11.5px] text-foreground">{friendly(d.prop)}</span>
+                  {!applied && <span className="text-[9.5px] text-warning">overridden</span>}
+                </span>
+                <span className="flex min-w-0 items-center gap-1.5 font-mono text-[11px] text-muted-foreground">
+                  {isColorish(d.prop, d.value) && <span className="size-3 shrink-0 rounded-full border" style={{ background: d.value }} />}
+                  <span className="truncate" title={d.value}>{d.value}{d.important ? " !important" : ""}</span>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      ) : !src ? (
         <p className="text-[11px] text-muted-foreground">Made by a framework (such as Tailwind), not written in your CSS, so it can't be edited here: <code className="font-mono break-all">{m.live.rule.style.cssText}</code></p>
       ) : (
         <div className="grid gap-1">
           {decls.map((d, i) => {
-            const applied = cas.applied.has(`${key}#${i}`) || !!m.state || !m.active;
+            const applied = m.state ? !cas.stateOverridden.has(`${key}#${i}`) : cas.applied.has(`${key}#${i}`) || !m.active;
             const swatch = isColorish(d.prop, d.value);
             return (
               <div key={`${d.prop}-${i}`} className={cn("group grid grid-cols-[100px_minmax(0,1fr)_20px] items-center gap-1.5", !applied && "opacity-60")}>

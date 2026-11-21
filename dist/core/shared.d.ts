@@ -115,6 +115,8 @@ declare const composeClamp: ([a, b, c]: readonly string[]) => string;
 declare const WEIGHT_NAMES: [number, string][];
 /** 650 -> "Semibold+"; "bold" -> "Bold" */
 declare function weightName(w: string): string;
+/** "color: red; font: 500 14px/1 var(--f) !important" -> declarations (semicolons inside () or quotes kept). */
+declare function parseDecls(text: string): Decl[];
 
-export { WEIGHT_NAMES, alignRules, compareSpec, composeBox, composeClamp, describeCondition, describeState, expandBox, formatNumber, normCondition, normSelector, nudge, numberAt, parseClamp, readProp, ruleKey, sameDecls, serializeDecls, sizeQueryMatches, specificity, splitTop, stepFor, weightName, writeProp, writeSides };
+export { WEIGHT_NAMES, alignRules, compareSpec, composeBox, composeClamp, describeCondition, describeState, expandBox, formatNumber, normCondition, normSelector, nudge, numberAt, parseClamp, parseDecls, readProp, ruleKey, sameDecls, serializeDecls, sizeQueryMatches, specificity, splitTop, stepFor, weightName, writeProp, writeSides };
 export type { Alignment, Decl, NumberToken, RuleRef, Side, SizeEnv, SourceRule, Spec };

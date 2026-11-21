@@ -13,6 +13,7 @@ import {
   nudge,
   numberAt,
   parseClamp,
+  parseDecls,
   readProp,
   ruleKey,
   sameDecls,
@@ -24,7 +25,7 @@ import {
   weightName,
   writeProp,
   writeSides
-} from "../chunk-RCYO64ZZ.js";
+} from "../chunk-7HBNJRG7.js";
 import "../chunk-MLKGABMK.js";
 export {
   WEIGHT_NAMES,
@@ -41,6 +42,7 @@ export {
   nudge,
   numberAt,
   parseClamp,
+  parseDecls,
   readProp,
   ruleKey,
   sameDecls,

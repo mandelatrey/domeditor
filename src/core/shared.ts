@@ -498,3 +498,30 @@ export function weightName(w: string): string {
   const below = [...WEIGHT_NAMES].reverse().find(([v]) => v < n);
   return below ? `${below[1]}+` : WEIGHT_NAMES[0]![1];
 }
+
+/** "color: red; font: 500 14px/1 var(--f) !important" -> declarations (semicolons inside () or quotes kept). */
+export function parseDecls(text: string): Decl[] {
+  const out: Decl[] = [];
+  let depth = 0, quote = "", cur = "";
+  const flush = () => {
+    const i = cur.indexOf(":");
+    if (i > 0) {
+      const prop = cur.slice(0, i).trim();
+      let value = cur.slice(i + 1).trim();
+      const important = /!\s*important\s*$/i.test(value);
+      if (important) value = value.replace(/!\s*important\s*$/i, "").trim();
+      if (prop && value) out.push({ prop, value, important });
+    }
+    cur = "";
+  };
+  for (const ch of text) {
+    if (quote) { if (ch === quote) quote = ""; }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    else if (ch === ";" && depth === 0) { flush(); continue; }
+    cur += ch;
+  }
+  flush();
+  return out;
+}
