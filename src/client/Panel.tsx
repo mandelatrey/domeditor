@@ -2,14 +2,15 @@
 // change into the .css file its rule came from. Rendered inside a shadow root (see index.tsx).
 import {
   AlignCenter, AlignJustify, AlignLeft, AlignRight, ArrowDown, ArrowUp, Check, ChevronRight, CircleAlert, ClipboardPaste, Copy,
-  CornerDownLeft, Database, FileCode, Link2, Minus, MousePointer2, PanelLeft, PanelRight, Plus, SquareDashedMousePointer, Undo2, X,
+  CornerDownLeft, Database, FileCode, Link2, Minus, Unlink, MousePointer2, PanelLeft, PanelRight, Plus, SquareDashedMousePointer, Undo2, X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import {
   composeClamp, describeCondition, describeState, nudge, parseClamp, readProp, WEIGHT_NAMES, weightName, writeProp, writeSides,
   type Decl, type Side,
-  withAlpha, writtenAlpha,
+  withAlpha, writtenAlpha, compareSpec, specificity, splitTop, type Spec,
 } from "../core/shared";
+import { isClassName, narrowSelector } from "../core/classes";
 import { resolveOnPage, toHex, toRgba } from "./color";
 import { cleanScheme, EDITORS, editorLabel, editorUrl, getEditor, setEditor } from "./editor";
 import { isEverywhere, modeLabel, widthCondition, widthLabel, widthOptions, type Mode, type Width } from "../core/scope";
@@ -17,7 +18,7 @@ import { pageIsDark } from "./page";
 import { copyStyle, cssText, differences, GROUPS, pasteInto, type Copied, type Difference, type GroupId } from "./copyStyle";
 import {
   cascade, conditionLabel, defaultTarget, inheritedFrom, label, segmentsFor, shortFile, store, suggestSelector, textIndex,
-  type Cascade, type Match, type Piece, type Place, type TextIndex, type TextKey,
+  type Cascade, type Match, type Piece, type Place, type Site, type TextIndex, type TextKey,
 } from "./model";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -167,6 +168,11 @@ export function Panel() {
               <Badge variant="warning" className="max-w-28 truncate">{[store.scope.mode === "all" ? "" : store.scope.mode === "dark" ? "Dark" : "Light", store.scope.width ? `${store.scope.width.kind === "max" ? "≤" : "≥"}${store.scope.width.px}px` : ""].filter(Boolean).join(" · ")}</Badge>
             </Tip>
           )}
+          {store.selected && store.owns.has(store.selected) && (
+            <Tip label="Edits go into a style for the selected element only. Change it under Design → Changes apply to.">
+              <Badge variant="warning" className="shrink-0">Only this</Badge>
+            </Tip>
+          )}
           <span className="flex-1" />
           <Tip label={<>Pick an element. Or {ALT}+click anything, any time. <Kbd>Esc</Kbd> stops.</>}>
             <Button size="sm" variant={store.picking ? "default" : "outline"} aria-pressed={store.picking}
@@ -226,8 +232,8 @@ function Inspector({ el }: { el: Element }) {
   const cas = useMemo(() => cascade(el), [el, version]);
   const inherited = useMemo(() => inheritedFrom(el, TEXT_PROPS), [el, version]);
   const editable = cas.matches.filter((m) => !m.state && m.live.source);
-  const target = (store.target && editable.find((m) => m.live.key === store.target)) || defaultTarget(el, cas.matches);
-  const wt = writeTarget(target);
+  const target = currentTarget(el, cas);
+  const wt = writeTarget(target, el);
   const [tab, setTab] = useState(() => readLocal(TAB_KEY, "design"));
   const cs = getComputedStyle(el);
   const r = el.getBoundingClientRect();
@@ -333,21 +339,38 @@ type WriteTarget = {
   /** the rule's key when edits go straight into it (no scope) */
   key: string | null;
   scoped: ReturnType<typeof store.scopedTargets> | null;
+  /** only this element: the selector of the rule narrowed to it, and how strong it is */
+  own: { selector: string; spec: Spec } | null;
 };
 
-function writeTarget(target: Match | null): WriteTarget | null {
+/** The rule the Design controls edit: the one chosen, or the element's own class rule. */
+function currentTarget(el: Element, cas: Cascade): Match | null {
+  const editable = cas.matches.filter((m) => !m.state && m.live.source);
+  return (store.target && editable.find((m) => m.live.key === store.target)) || defaultTarget(el, cas.matches);
+}
+
+/** The rule's own @media, to keep a narrowed copy of it in (one plain media query only). */
+const ownMedia = (m: Match) => {
+  const [c, ...more] = m.live.conds;
+  return c instanceof CSSMediaRule && !more.length && c.media.length === 1 ? c.media.mediaText : null;
+};
+
+function writeTarget(target: Match | null, el?: Element): WriteTarget | null {
   const src = target?.live.source;
   if (!target || !src) return null;
-  if (isEverywhere(store.scope)) {
+  const own = el ? store.owns.get(el) : undefined;
+  if (!own && isEverywhere(store.scope)) {
     const key = target.live.key;
-    return { decls: store.declsOf(key), write: (fn) => store.setDecls(key, fn(store.declsOf(key))), key, scoped: null };
+    return { decls: store.declsOf(key), write: (fn) => store.setDecls(key, fn(store.declsOf(key))), key, scoped: null, own: null };
   }
-  const scoped = store.scopedTargets(src);
+  const narrowed = own ? narrowSelector(target.part, own.cls) : null;
+  const scoped = narrowed ? store.ownTargets(src, narrowed, ownMedia(target)) : store.scopedTargets(src);
   const read = (t: (typeof scoped)[number]) => (t.key ? store.declsOf(t.key) : store.virtualDecls(t.file, t.rule));
   return {
     decls: read(scoped[0]!),
     key: null,
     scoped,
+    own: narrowed ? { selector: narrowed, spec: specificity(splitTop(scoped[0]!.rule.selector)[0] ?? narrowed) } : null,
     // the scoped rules mirror each other (dark mode by system setting, and by theme switch)
     write: (fn) => {
       const next = fn(read(scoped[0]!));
@@ -357,6 +380,151 @@ function writeTarget(target: Match | null): WriteTarget | null {
       }
     },
   };
+}
+
+/** The unsaved changes in where edits go (what differs from the file), and taking them out of it. */
+function pendingIn(wt: WriteTarget | null): Decl[] {
+  if (!wt) return [];
+  const diff = (key: string) => {
+    const was = store.sources.get(key)?.decls ?? [];
+    return store.declsOf(key).filter((d) => readProp(was, d.prop) !== d.value);
+  };
+  if (wt.key) return diff(wt.key);
+  const t = wt.scoped?.[0];
+  return !t ? [] : t.key ? diff(t.key) : store.virtualDecls(t.file, t.rule);
+}
+function dropPending(wt: WriteTarget | null) {
+  if (!wt) return;
+  if (wt.key) store.revert(wt.key);
+  for (const t of wt.scoped ?? []) {
+    if (t.key) store.revert(t.key);
+    else store.setVirtual(t.file, t.rule, []);
+  }
+}
+/** Move unsaved changes from one place edits go to another (sharing a style, or not). */
+function movePending(from: WriteTarget | null, to: () => WriteTarget | null) {
+  const moved = pendingIn(from);
+  if (!moved.length) return;
+  dropPending(from);
+  to()?.write((d) => moved.reduce((acc, m) => writeProp(acc, m.prop, m.value), d));
+}
+
+/** Edit another rule with the Design controls. For an element with a class of its own, its unsaved
+ *  changes follow, narrowed to the new rule. */
+function retarget(key: string) {
+  const el = store.selected;
+  if (el && store.owns.has(el)) {
+    const cas = cascade(el);
+    const from = writeTarget(currentTarget(el, cas), el);
+    store.target = key;
+    movePending(from, () => writeTarget(currentTarget(el, cascade(el)), el));
+  } else store.target = key;
+  store.emit();
+}
+
+/** A class name for an element's own style: its first class and the first words of its text
+ *  (`lp-h2` + "Your next drop" -> `lp-h2-your-next`), not used anywhere yet. */
+function suggestClass(el: Element): string {
+  const base = Array.from(el.classList)[0] ?? el.tagName.toLowerCase();
+  const words = (el.textContent ?? "").toLowerCase().match(/[a-z0-9]+/g)?.slice(0, 2).join("-");
+  const stem = `${base}-${words || "own"}`.slice(0, 40).replace(/-+$/, "");
+  const taken = (c: string) => document.getElementsByClassName(c).length > 0
+    || [...store.sources.values()].some((s) => new RegExp(`\\.${c}(?![\\w-])`).test(s.selector));
+  let cls = stem;
+  for (let n = 2; taken(cls); n++) cls = `${stem}-${n}`;
+  return cls;
+}
+
+/** Only this element: give it a class of its own and narrow the style to it. Unsaved changes to the
+ *  shared style move with it. */
+function startOwn(el: Element, target: Match) {
+  const from = writeTarget(target, el);
+  void store.startOwn(el, suggestClass(el));
+  movePending(from, () => writeTarget(target, el));
+}
+/** Back to the shared style: its unsaved changes go back there. */
+function stopOwn(el: Element, target: Match | null) {
+  const from = writeTarget(target, el);
+  const moved = pendingIn(from);
+  store.stopOwn(el);
+  if (moved.length) writeTarget(target, el)?.write((d) => moved.reduce((acc, m) => writeProp(acc, m.prop, m.value), d));
+}
+
+function OwnControl({ el, target, wt }: { el: Element; target: Match; wt: WriteTarget | null }) {
+  const own = store.owns.get(el);
+  const count = useMemo(() => countMatches(withoutStates(target.live.rule.selectorText)), [target.live.rule.selectorText, own?.cls]);
+  const [name, setName] = useState(own?.cls ?? "");
+  useEffect(() => setName(own?.cls ?? ""), [own?.cls]);
+  if (!own) {
+    if (count < 2) return null;
+    return (
+      <div className="flex items-center justify-between gap-2 rounded-md border border-dashed px-2 py-1.5 text-[11px] text-muted-foreground">
+        <span>This style is shared by {count} elements.</span>
+        <Tip label="Change only this element: it gets a class of its own and a style narrowed to it. The others keep this one.">
+          <Button size="sm" variant="outline" className="h-6 shrink-0 gap-1 px-2" onClick={() => startOwn(el, target)}>
+            <Unlink className="size-3" />Only this element
+          </Button>
+        </Tip>
+      </div>
+    );
+  }
+  const tag = `<${own.info.tag}>`;
+  const sites = Array.isArray(own.sites) ? own.sites : [];
+  const valid = isClassName(name);
+  const css = wt?.scoped?.find((t) => !t.key)?.file ?? wt?.scoped?.[0]?.file;
+  return (
+    <div className="grid gap-1.5 rounded-md border border-primary/40 bg-primary/5 p-2 text-[11px]">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1.5 font-medium text-foreground"><Unlink className="size-3.5 text-primary" />Only this element</span>
+        <Tip label="Follow the shared style again. Unsaved changes go back to it.">
+          <Button size="sm" variant="ghost" className="h-6 gap-1 px-1.5" onClick={() => stopOwn(el, target)}><Link2 className="size-3" />Share again</Button>
+        </Tip>
+      </div>
+      <label className="grid grid-cols-[44px_minmax(0,1fr)] items-center gap-1.5">
+        <span className="text-muted-foreground">Class</span>
+        <Input className={cn("h-7 font-mono text-[11.5px]", !valid && "border-destructive")} value={name} spellCheck={false} aria-label="Class name"
+          onChange={(e) => { setName(e.target.value); if (isClassName(e.target.value)) store.renameOwn(el, e.target.value); }} />
+      </label>
+      {own.sites === "looking" && <p className="text-muted-foreground">Looking for where this {tag} is written…</p>}
+      {own.at && (
+        <p className="leading-relaxed text-muted-foreground">
+          On save, adds <code className="font-mono text-foreground">{own.cls}</code> to the {tag} in{" "}
+          <PlaceLink place={own.at} />{wt?.own && <> and edits go into <code className="font-mono text-foreground break-all">{short(wt.own.selector, 60)}</code>{css ? <> in {shortFile(css)}</> : null}</>}.
+          {" "}The other {count - 1 > 1 ? `${count - 1} elements keep` : "element keeps"} the shared style.
+        </p>
+      )}
+      {!own.at && sites.length > 0 && (
+        <div className="grid gap-1">
+          <p className="text-muted-foreground">
+            {sites.some((x) => x.text) ? `This text is in ${sites.filter((x) => x.text).length} ${tag} tags with these classes. Which one is this?`
+              : `Could not tell which ${tag} with these classes this is${own.info.text ? " (none holds its text, so a component may draw it, or the text comes from data)" : ""}. Choose one; a tag in a component or a loop gives the class to every element it draws.`}
+          </p>
+          {(sites.some((x) => x.text) ? sites.filter((x) => x.text) : sites).slice(0, 8).map((x) => (
+            <SiteChoice key={`${x.file}:${x.line}`} el={el} site={x} />
+          ))}
+        </div>
+      )}
+      {(own.sites === "failed" || (Array.isArray(own.sites) && sites.length === 0)) && (
+        <p className="flex items-start gap-1.5 rounded-md border border-warning/30 bg-warning/10 px-2 py-1.5 text-warning">
+          <CircleAlert className="mt-px size-3.5 shrink-0" />
+          <span>
+            {own.sites === "failed" ? "Could not ask the dev server where this element is written." :
+              <>Could not find this {tag} in the code with its classes written out as text (they may be built by a function such as <code className="font-mono">cn()</code>, or come from props).</>}
+            {" "}Add a class to it in the code yourself, then style that class.
+          </span>
+        </p>
+      )}
+    </div>
+  );
+}
+
+function SiteChoice({ el, site }: { el: Element; site: Site }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <PlaceLink place={site} />
+      <Button size="sm" variant="outline" className="h-6 px-2" onClick={() => store.chooseOwnSite(el, site)}>This one</Button>
+    </div>
+  );
 }
 
 /** "When": which mode and screen size edits apply to. */
@@ -389,7 +557,7 @@ function ScopePicker({ wt }: { wt: WriteTarget | null }) {
           {widths.map((w) => <option key={`${w.kind}:${w.px}`} value={`${w.kind}:${w.px}`}>{widthLabel(w)}</option>)}
         </NativeSelect>
       </div>
-      {wt?.scoped && (
+      {wt?.scoped && !wt.own && (
         <p className="text-[10.5px] leading-relaxed text-muted-foreground">
           {existing.length > 0 && <>Edits <code className="font-mono">{short(existing.map((t) => store.sources.get(t.key!)?.selector).join(" + "), 60)}</code>. </>}
           {fresh.length > 0 && (
@@ -730,7 +898,14 @@ function Quick({ el, cs, cas, target, editable, inherited, wt }: QuickProps) {
   // a declaration in the target will not show if a rule with higher priority sets the same longhand
   const overriddenBy = (longhand: string) => {
     const w = cas.winner.get(longhand);
-    if (!w || !key || w === key || rank(w) > rank(key)) return null;
+    if (!w) return null;
+    // only this element: the narrowed style (not on the page as a rule yet) loses to a stronger selector
+    if (wt?.own) {
+      if (w === "inline") return w;
+      const m = cas.matches.find((x) => x.live.key === w);
+      return m && compareSpec(m.spec, wt.own.spec) > 0 ? w : null;
+    }
+    if (!key || w === key || rank(w) > rank(key)) return null;
     return w;
   };
   const note = (prop: string, longhand = prop) => (
@@ -749,10 +924,11 @@ function Quick({ el, cs, cas, target, editable, inherited, wt }: QuickProps) {
   return (
     <>
       <Section title="Changes apply to">
-        <NativeSelect aria-label="Rule the controls edit" value={target.live.key} onChange={(e) => { store.target = e.target.value; store.emit(); }}>
+        <NativeSelect aria-label="Rule the controls edit" value={target.live.key} onChange={(e) => retarget(e.target.value)}>
           {editable.map((m) => <option key={m.live.key} value={m.live.key}>{ruleLabel(m)}</option>)}
         </NativeSelect>
         <RuleMeta m={target} />
+        <OwnControl el={el} target={target} wt={wt} />
         <ScopePicker wt={wt} />
       </Section>
 
@@ -835,12 +1011,13 @@ function Note({ prop, over, from }: { prop: string; over: string | null; from: {
     const live = over === "inline" ? null : store.live.find((l) => l.key === over);
     const editable = !!live?.source;
     const sel = over === "inline" ? "an inline style" : live?.source?.selector ?? live?.rule.selectorText ?? "another style";
-    const where = over === "inline" ? "" : editable ? " Click to edit that one instead."
+    const narrowing = !!store.selected && store.owns.has(store.selected);
+    const where = over === "inline" ? "" : editable ? (narrowing ? " Click to narrow that one to this element instead." : " Click to edit that one instead.")
       : live?.origin === "style-tag" ? " It is written in a <style> tag in a component: change it there." : " It is not in your CSS files.";
     return (
       <Tip label={`A stronger style sets ${prop}, so changes here will not show.${where}`}>
         <button type="button" className="justify-self-start truncate text-left text-[10.5px] text-warning hover:underline"
-          onClick={() => { if (editable) { store.target = over; store.emit(); } }}>
+          onClick={() => { if (editable) retarget(over); }}>
           overridden by {short(sel, 28)}
         </button>
       </Tip>
@@ -1376,7 +1553,7 @@ function StyleCard({ m, cas, isTarget }: { m: Match; cas: Cascade; isTarget: boo
         )}
         {isTarget ? <Badge variant="outline">In Design</Badge> : src && !m.state && (
           <Tip label="Edit this style with the Design controls">
-            <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => { store.target = key; store.emit(); }}>Use in Design</Button>
+            <Button size="sm" variant="ghost" className="h-5 px-1.5" onClick={() => retarget(key)}>Use in Design</Button>
           </Tip>
         )}
       </div>

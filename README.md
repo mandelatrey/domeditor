@@ -42,6 +42,15 @@ of it in a production build.
   both when the project switches dark mode by the system setting *and* a theme switch. A scoped style that
   already exists is edited; otherwise it is previewed and created on Save. The panel's header shows the scope,
   and warns when the page is not showing it (light mode, another width).
+- **Only this element** (under *Changes apply to*, when the style is shared by several elements): change one
+  element without changing the others. It gets a class of its own (`lp-h2-your-next`, editable), and your edits go
+  into a copy of the chosen style narrowed to it (`.lp-h2-light.lp-h2-your-next`), so it keeps everything else
+  the shared style gives it. Unsaved edits you already made to the shared style move with it. On Save the class
+  is added to the element's tag in its component (found by its classes and the text inside it; if two tags
+  match, you choose) and the narrowed style to the stylesheet. If a stronger style still wins, the *overridden by*
+  note narrows that one instead. Combines with *When* (dark mode only, a screen size). *Share again* undoes it.
+  An element whose classes are built by a function (`cn(...)`) or passed in as props cannot be found; add a
+  class in the code yourself.
 - **All styles** tab: every style that applies to the element, grouped as *on this element*, *other screen
   sizes* ("Screens up to 640px wide"), *hover, focus and other states*, and collapsed *base styles*
   (page-wide defaults, framework styles). Properties have plain names, colours show a swatch, and a value a

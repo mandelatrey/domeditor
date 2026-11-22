@@ -5,6 +5,10 @@ import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import postcss, { type AtRule, type Declaration, type Rule } from "postcss";
 import { normCondition, normSelector, sameDecls, type Decl, type RuleRef, type SourceRule } from "./shared";
+import { addClass, matchSites, type ElementInfo } from "./classes";
+import { textPattern } from "./text";
+
+export { textPattern };
 
 export class EditError extends Error {}
 
@@ -123,25 +127,6 @@ export type TextHit = { file: string; line: number; index: number; length: numbe
 export type TextEdit = { before: string; after: string; at?: { file: string; line: number } };
 
 const TEXT_EXT = /\.(tsx|jsx|ts|js|mjs|mdx|md|html|vue|svelte|astro)$/;
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-// how a character the page shows may be written in source: JSX entities, escapes, line wrapping
-const SPELLINGS: Record<string, string> = {
-  "'": "(?:'|&apos;|&#39;|&rsquo;|\\\\')",
-  "’": "(?:’|&rsquo;|')",
-  '"': '(?:"|&quot;|&#34;|\\\\")',
-  "&": "(?:&|&amp;)",
-  "\u00a0": "(?:\u00a0|&nbsp;|&#160;|\\s)",
-};
-
-/** A pattern for text as the page shows it, matching the ways it is commonly written in source. */
-export function textPattern(text: string): RegExp | null {
-  const t = text.replace(/\s+/g, " ").trim();
-  if (!t) return null;
-  let src = "";
-  for (const ch of t) src += ch === " " ? "\\s+" : SPELLINGS[ch] ?? escapeRe(ch);
-  return new RegExp(src, "g");
-}
-
 /** Every place a text is written in one file's contents: as a whole "string", or as a whole run of
  *  JSX/HTML text between tags and {expressions} (the same pieces React and the browser make text nodes of). */
 export function findTextIn(content: string, file: string, text: string): TextHit[] {
@@ -287,6 +272,10 @@ type SaveRequest = {
   find?: string[];
   /** for texts a script split up: the source strings each is made of */
   pieces?: string[];
+  /** look up where an element is written (to give it a class of its own), without changing anything */
+  locate?: ElementInfo;
+  /** classes to add to elements where they are written ("only this element") */
+  classes?: { file: string; line: number; tag: string; classes: string[]; add: string }[];
 };
 
 /** A text change that cannot be made as asked: not in the code, or in more than one place. */
@@ -322,7 +311,7 @@ export function createHandler(options: HandlerOptions = {}): (req: Request) => P
       if (req.method === "POST") {
         const text = await req.text();
         if (text.length > 1_000_000) throw new EditError("request too large");
-        const { edits = [], create, creates = [], texts = [], find, pieces } = JSON.parse(text) as SaveRequest;
+        const { edits = [], create, creates = [], texts = [], find, pieces, locate, classes = [] } = JSON.parse(text) as SaveRequest;
         const sources = () => projectFiles(root, options.include, options.exclude, TEXT_EXT);
         const lookup = (t: string, read: (f: string) => string) =>
           sources().flatMap((f) => {
@@ -332,6 +321,13 @@ export function createHandler(options: HandlerOptions = {}): (req: Request) => P
         if (pieces) {
           const files = sources().map((f) => ({ file: f, content: read(f) })).filter((f) => f.content.length <= 2_000_000);
           return json(200, { pieces: pieces.map((t) => findPieces(files, t)) });
+        }
+        if (locate) {
+          const sites = sources().flatMap((f) => {
+            const c = read(f);
+            return c.length > 2_000_000 ? [] : matchSites(c, f, locate);
+          });
+          return json(200, { sites: sites.map(({ file, line, tokens, text }) => ({ file, line, tokens, text })) });
         }
         if (find) {
           const cache = new Map<string, string>();
@@ -357,6 +353,18 @@ export function createHandler(options: HandlerOptions = {}): (req: Request) => P
             const hit = hits[0]!;
             if (!editable.has(hit.file)) throw new EditError(`not an editable file: ${hit.file}`);
             byFile.set(hit.file, replaceText(now(hit.file), hit, t.after));
+          }
+        }
+        if (classes.length) {
+          const editable = new Set(sources());
+          const now = (f: string) => byFile.get(f) ?? read(f);
+          for (const c of classes) {
+            if (!editable.has(c.file)) throw new EditError(`not an editable file: ${c.file}`);
+            try {
+              byFile.set(c.file, addClass(now(c.file), c, c.add));
+            } catch (e) {
+              throw new EditError((e as Error).message);
+            }
           }
         }
         // every edit applied cleanly: only now write, so a refused edit leaves all files untouched

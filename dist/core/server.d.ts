@@ -1,6 +1,9 @@
 import postcss, { Rule } from 'postcss';
 import { Decl, RuleRef, SourceRule } from './shared.js';
 
+/** A pattern for text as the page shows it, matching the ways it is commonly written in source. */
+declare function textPattern(text: string): RegExp | null;
+
 declare class EditError extends Error {
 }
 /** Every style rule in a stylesheet, with the reference the browser side uses to find it. */
@@ -36,8 +39,6 @@ type TextEdit = {
         line: number;
     };
 };
-/** A pattern for text as the page shows it, matching the ways it is commonly written in source. */
-declare function textPattern(text: string): RegExp | null;
 /** Every place a text is written in one file's contents: as a whole "string", or as a whole run of
  *  JSX/HTML text between tags and {expressions} (the same pieces React and the browser make text nodes of). */
 declare function findTextIn(content: string, file: string, text: string): TextHit[];

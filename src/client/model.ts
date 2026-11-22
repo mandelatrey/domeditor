@@ -4,6 +4,7 @@ import {
   alignRules, compareSpec, normCondition, normSelector, ruleKey, parseDecls, sameDecls, serializeDecls, sizeQueryMatches, specificity, splitTop,
   type Decl, type RuleRef, type SourceRule, type Spec,
 } from "../core/shared";
+import { hasClassToken, renameClassToken, type ElementInfo } from "../core/classes";
 import { EVERYWHERE, modePattern, scopedContext, scopedRules, type ModePattern, type Scope, type ScopedRule } from "../core/scope";
 
 const HEADERS = { "x-domeditor": "1", "Content-Type": "application/json" };
@@ -100,6 +101,32 @@ export function segmentsFor(index: TextIndex, start: number, end: number): Segme
   return [...out.values()];
 }
 
+/** Where an element's tag may be written, from the dev server: its written classes, and whether the tag
+ *  holds the element's text. */
+export type Site = Place & { tokens: string[]; text: boolean };
+
+/** "Only this element": an element given a class of its own (on the page now, in its component on
+ *  save), so styles can be narrowed to it while the others keep the shared style. */
+export type Own = {
+  el: Element;
+  cls: string;
+  info: ElementInfo; // its tag, classes (without cls) and text, to find where it is written
+  sites: Site[] | "looking" | "failed";
+  at: Site | null; // the tag the class goes on
+};
+
+/** An element's tag, classes and the longest text inside it, as its source would have them. */
+function elementInfo(el: Element, without?: string): ElementInfo {
+  let text = "";
+  const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+    const t = squash(store.originalOf(n as Text));
+    if (t.length > text.length) text = t;
+  }
+  const classes = Array.from(el.classList).filter((c) => c !== without);
+  return { tag: el.tagName.toLowerCase(), classes, text: text.length >= 2 ? text.slice(0, 160) : "" };
+}
+
 /** A scoped rule not written yet: where it will go, and its declarations. */
 export type VirtualRule = ScopedRule & { file: string; decls: Decl[] };
 const virtualKey = (file: string, r: ScopedRule) => JSON.stringify([file, r.media, normSelector(r.selector)]);
@@ -166,6 +193,7 @@ class Store {
   texts = new Map<TextKey, TextChange>(); // text changes (unsaved)
   scope: Scope = EVERYWHERE; // where edits apply: every mode and size, or only dark mode, a screen size...
   virtuals = new Map<string, VirtualRule>(); // scoped rules not written yet: previewed, created on save
+  owns = new Map<Element, Own>(); // elements given a class of their own (unsaved)
   private previewEl: HTMLStyleElement | null = null;
   private previewUntilLoad = false;
   private pattern: ModePattern | null = null;
@@ -190,6 +218,8 @@ class Store {
   };
   getVersion = () => this.version;
   emit() {
+    // a re-render of the component can drop a class it does not know about yet
+    for (const o of this.owns.values()) if (o.el.isConnected && !o.el.classList.contains(o.cls)) o.el.classList.add(o.cls);
     this.version++;
     for (const l of this.listeners) l();
   }
@@ -306,13 +336,78 @@ class Store {
   /** Where an edit to a rule goes in the current scope: the rule itself, or the scoped rule(s) for it,
    *  each one already written (key) or not yet (virtual). */
   scopedTargets(base: SourceRule): { rule: ScopedRule; file: string; key: string | null }[] {
-    return scopedRules(base.selector, this.scope, this.modePattern()).map((rule) => {
-      const context = JSON.stringify(scopedContext(rule));
-      const selector = normSelector(rule.selector);
-      const found = (this.byFile.get(base.file) ?? []).find((s) => s.selector === selector && JSON.stringify(s.context) === context)
-        ?? [...this.sources.values()].find((s) => s.selector === selector && JSON.stringify(s.context) === context);
-      return { rule, file: found?.file ?? base.file, key: found ? ruleKey(found) : null };
-    });
+    return scopedRules(base.selector, this.scope, this.modePattern()).map((rule) => this.findScoped(base.file, rule));
+  }
+
+  /** Where an edit goes for an element with a class of its own: a copy of the rule narrowed to it
+   *  (`selector`), in the current scope, inside `media` (the rule's own @media) if any. */
+  ownTargets(base: SourceRule, selector: string, media: string | null): { rule: ScopedRule; file: string; key: string | null }[] {
+    return scopedRules(selector, this.scope, this.modePattern()).map((r) =>
+      this.findScoped(base.file, { selector: r.selector, media: [media, r.media].filter(Boolean).join(" and ") || null }));
+  }
+
+  private findScoped(file: string, rule: ScopedRule) {
+    const context = JSON.stringify(scopedContext(rule));
+    const selector = normSelector(rule.selector);
+    const found = (this.byFile.get(file) ?? []).find((s) => s.selector === selector && JSON.stringify(s.context) === context)
+      ?? [...this.sources.values()].find((s) => s.selector === selector && JSON.stringify(s.context) === context);
+    return { rule, file: found?.file ?? file, key: found ? ruleKey(found) : null };
+  }
+
+  /** Give an element a class of its own: on the page at once, and look up where it is written. */
+  async startOwn(el: Element, cls: string) {
+    const info = elementInfo(el);
+    const own: Own = { el, cls, info, sites: "looking", at: null };
+    this.owns.set(el, own);
+    el.classList.add(cls);
+    this.message = null;
+    this.emit();
+    try {
+      const r = await fetch(this.endpoint, { method: "POST", headers: HEADERS, body: JSON.stringify({ locate: info }) });
+      if (!r.ok) throw new Error(String(r.status));
+      const sites = ((await r.json()) as { sites?: Site[] }).sites ?? [];
+      // the tag that holds the element's text; without a text, the only tag there is
+      const withText = sites.filter((s) => s.text);
+      const at = withText.length === 1 ? withText[0]! : !info.text && sites.length === 1 ? sites[0]! : null;
+      if (this.owns.get(el) === own) this.owns.set(el, { ...own, sites, at });
+    } catch {
+      if (this.owns.get(el) === own) this.owns.set(el, { ...own, sites: "failed" });
+    }
+    this.emit();
+  }
+
+  chooseOwnSite(el: Element, at: Site) {
+    const o = this.owns.get(el);
+    if (o) this.owns.set(el, { ...o, at });
+    this.emit();
+  }
+
+  /** Rename an element's own class, in its unsaved rules too. */
+  renameOwn(el: Element, cls: string) {
+    const o = this.owns.get(el);
+    if (!o || o.cls === cls) return;
+    for (const [k, v] of [...this.virtuals]) {
+      if (!hasClassToken(v.selector, o.cls)) continue;
+      this.virtuals.delete(k);
+      const next = { ...v, selector: renameClassToken(v.selector, o.cls, cls) };
+      this.virtuals.set(virtualKey(next.file, next), next);
+    }
+    el.classList.remove(o.cls);
+    el.classList.add(cls);
+    this.owns.set(el, { ...o, cls });
+    this.renderPreview();
+    this.emit();
+  }
+
+  /** Take an element's own class away again, with any unsaved rules for it. */
+  stopOwn(el: Element) {
+    const o = this.owns.get(el);
+    if (!o) return;
+    for (const [k, v] of [...this.virtuals]) if (hasClassToken(v.selector, o.cls)) this.virtuals.delete(k);
+    if (!o.info.classes.includes(o.cls)) el.classList.remove(o.cls);
+    this.owns.delete(el);
+    this.renderPreview();
+    this.emit();
   }
 
   virtualDecls(file: string, rule: ScopedRule): Decl[] {
@@ -420,6 +515,8 @@ class Store {
     for (const key of [...this.edits.keys()]) this.revert(key);
     for (const key of [...this.texts.keys()]) this.revertText(key);
     this.virtuals.clear();
+    for (const o of this.owns.values()) if (!o.info.classes.includes(o.cls)) o.el.classList.remove(o.cls);
+    this.owns.clear();
     this.renderPreview();
     this.emit();
   }
@@ -433,7 +530,12 @@ class Store {
     const changes = [...this.texts.values()];
     const texts = changes.map((c) => ({ before: c.before, after: squash(c.after), at: c.at }));
     const creates = [...this.virtuals.values()].map(({ file, media, selector, decls }) => ({ file, media, selector, decls }));
-    const r = await this.post({ edits, texts, creates });
+    // classes of their own, for the elements that have a rule for them
+    const owns = [...this.owns.values()].filter((o) => creates.some((c) => hasClassToken(c.selector, o.cls)));
+    const lost = owns.find((o) => !o.at);
+    if (lost) return this.fail(`Choose where the <${lost.info.tag}> is written (under Changes apply to), so its class can be added there.`);
+    const classes = owns.map((o) => ({ file: o.at!.file, line: o.at!.line, tag: o.info.tag, classes: o.info.classes, add: o.cls }));
+    const r = await this.post({ edits, texts, creates, classes });
     if (!r.ok) {
       // a text written in several places: offer them, then the next save uses the one chosen
       const c = r.text !== undefined ? changes.find((x) => x.before === r.text) : undefined;
@@ -441,6 +543,9 @@ class Store {
       return this.fail(r.error);
     }
     this.texts.clear();
+    // the classes with rules are in the components now; the others go
+    for (const o of this.owns.values()) if (!owns.includes(o) && !o.info.classes.includes(o.cls)) o.el.classList.remove(o.cls);
+    this.owns.clear();
     this.places.clear();
     this.pieces.clear();
     for (const [key, after] of this.edits) {
