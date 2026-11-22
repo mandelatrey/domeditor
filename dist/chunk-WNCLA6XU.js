@@ -1,4 +1,9 @@
 import {
+  addClass,
+  matchSites,
+  textPattern
+} from "./chunk-PUZS77LQ.js";
+import {
   normCondition,
   normSelector,
   sameDecls
@@ -113,21 +118,6 @@ ${rule}
 `;
 }
 var TEXT_EXT = /\.(tsx|jsx|ts|js|mjs|mdx|md|html|vue|svelte|astro)$/;
-var escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-var SPELLINGS = {
-  "'": "(?:'|&apos;|&#39;|&rsquo;|\\\\')",
-  "\u2019": "(?:\u2019|&rsquo;|')",
-  '"': '(?:"|&quot;|&#34;|\\\\")',
-  "&": "(?:&|&amp;)",
-  "\xA0": "(?:\xA0|&nbsp;|&#160;|\\s)"
-};
-function textPattern(text) {
-  const t = text.replace(/\s+/g, " ").trim();
-  if (!t) return null;
-  let src = "";
-  for (const ch of t) src += ch === " " ? "\\s+" : SPELLINGS[ch] ?? escapeRe(ch);
-  return new RegExp(src, "g");
-}
 function findTextIn(content, file, text) {
   const re = textPattern(text);
   if (!re) return [];
@@ -254,7 +244,7 @@ function createHandler(options = {}) {
       if (req.method === "POST") {
         const text = await req.text();
         if (text.length > 1e6) throw new EditError("request too large");
-        const { edits = [], create, creates = [], texts = [], find, pieces } = JSON.parse(text);
+        const { edits = [], create, creates = [], texts = [], find, pieces, locate, classes = [] } = JSON.parse(text);
         const sources = () => projectFiles(root, options.include, options.exclude, TEXT_EXT);
         const lookup = (t, read2) => sources().flatMap((f) => {
           const c = read2(f);
@@ -263,6 +253,13 @@ function createHandler(options = {}) {
         if (pieces) {
           const files2 = sources().map((f) => ({ file: f, content: read(f) })).filter((f) => f.content.length <= 2e6);
           return json(200, { pieces: pieces.map((t) => findPieces(files2, t)) });
+        }
+        if (locate) {
+          const sites = sources().flatMap((f) => {
+            const c = read(f);
+            return c.length > 2e6 ? [] : matchSites(c, f, locate);
+          });
+          return json(200, { sites: sites.map(({ file, line, tokens, text: text2 }) => ({ file, line, tokens, text: text2 })) });
         }
         if (find) {
           const cache = /* @__PURE__ */ new Map();
@@ -290,6 +287,18 @@ function createHandler(options = {}) {
             byFile.set(hit.file, replaceText(now(hit.file), hit, t.after));
           }
         }
+        if (classes.length) {
+          const editable = new Set(sources());
+          const now = (f) => byFile.get(f) ?? read(f);
+          for (const c of classes) {
+            if (!editable.has(c.file)) throw new EditError(`not an editable file: ${c.file}`);
+            try {
+              byFile.set(c.file, addClass(now(c.file), c, c.add));
+            } catch (e) {
+              throw new EditError(e.message);
+            }
+          }
+        }
         for (const [f, css] of byFile) writeFileSync(join(root, f), css);
         return json(200, { ok: true, files: [...byFile.keys()] });
       }
@@ -306,7 +315,6 @@ export {
   sourceRules,
   applyRuleEdit,
   appendRule,
-  textPattern,
   findTextIn,
   replaceText,
   literalsIn,
